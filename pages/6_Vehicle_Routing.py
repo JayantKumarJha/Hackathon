@@ -15,28 +15,34 @@ import pandas as pd
 import numpy as np
 import folium
 from streamlit_folium import st_folium
-import math, warnings, requests, time
+import requests
+import time, math, warnings
 from ortools.constraint_solver import routing_enums_pb2, pywrapcp
 
 warnings.filterwarnings('ignore')
 
+# --------------------------
+# Streamlit Page 6 — Bin Packing + Vehicle Routing
+# --------------------------
+
 st.set_page_config(layout='wide')
 st.title("Page 6 — Bin Packing + Vehicle Routing (VRP)")
-st.markdown("Upload your vehicle & item files, assign coordinates, run packing and routing, and visualize routes.")
+st.markdown("Upload vehicle & item files, assign coordinates, run packing & routing, and visualize the routes.")
 
-# ---------- Helpers ----------
+# ---------------- Helpers ----------------
+
 def clean_item_columns(df: pd.DataFrame) -> pd.DataFrame:
     mapping = {
-        'location id': ['location id', 'Location ID', 'location_id', 'LocationId', 'loc_id'],
-        'id': ['id', 'ID', 'item_id', 'Item ID'],
-        'type': ['type', 'Type', 'item_type'],
-        'length': ['length', 'Length'],
-        'width': ['width', 'Width'],
-        'height': ['height', 'Height'],
-        'weight': ['weight', 'Weight'],
-        'quantity': ['quantity', 'Quantity', 'qty'],
-        'stackable': ['stackable', 'Stackable'],
-        'maxStack': ['maxStack', 'MaxStack', 'max_stack', 'Max Stack']
+        'location id': ['location id','Location ID','location_id','LocationId','loc_id'],
+        'id': ['id','ID','item_id','Item ID'],
+        'type': ['type','Type','item_type'],
+        'length': ['length','Length'],
+        'width': ['width','Width'],
+        'height': ['height','Height'],
+        'weight': ['weight','Weight'],
+        'quantity': ['quantity','Quantity','qty'],
+        'stackable': ['stackable','Stackable'],
+        'maxStack': ['maxStack','MaxStack','max_stack','Max Stack']
     }
     for correct, variants in mapping.items():
         for v in variants:
@@ -56,280 +62,327 @@ def ensure_session_state(key, default):
     if key not in st.session_state:
         st.session_state[key] = default
 
-# ---------- Manual refresh ----------
-if 'manual_refresh' not in st.session_state:
-    st.session_state['manual_refresh'] = True
+# ---------------- File Upload ----------------
+ensure_session_state('veh_file', None)
+ensure_session_state('item_file', None)
 
-if st.button("Manual Refresh"):
-    st.session_state['manual_refresh'] = True
-else:
-    st.session_state['manual_refresh'] = False
-
-if not st.session_state['manual_refresh']:
-    st.stop()
-
-# ---------- Upload ----------
 col1, col2 = st.columns([1,1])
 with col1:
-    veh_file = st.file_uploader("Vehicle file (CSV/XLSX)", type=['csv','xlsx'])
+    uploaded_veh = st.file_uploader("Vehicle file (CSV/XLSX)", type=['csv','xlsx'], key='veh_uploader')
+    if uploaded_veh:
+        st.session_state['veh_file'] = uploaded_veh
 with col2:
-    item_file = st.file_uploader("Items file (CSV/XLSX)", type=['csv','xlsx'])
+    uploaded_item = st.file_uploader("Items file (CSV/XLSX)", type=['csv','xlsx'], key='item_uploader')
+    if uploaded_item:
+        st.session_state['item_file'] = uploaded_item
 
-if not (veh_file and item_file):
+if not (st.session_state['veh_file'] and st.session_state['item_file']):
     st.info("Upload both vehicle and item files to proceed.")
     st.stop()
 
-# ---------- Load Data ----------
+veh_file = st.session_state['veh_file']
+item_file = st.session_state['item_file']
+
+# ---------------- Load Data ----------------
 try:
-    vehicle_df = pd.read_csv(veh_file) if veh_file.name.endswith('.csv') else pd.read_excel(veh_file)
-    item_df = pd.read_csv(item_file) if item_file.name.endswith('.csv') else pd.read_excel(item_file)
+    if veh_file.name.endswith('.csv'):
+        vehicle_df = pd.read_csv(veh_file)
+    else:
+        vehicle_df = pd.read_excel(veh_file)
+
+    if item_file.name.endswith('.csv'):
+        item_df = pd.read_csv(item_file)
+    else:
+        item_df = pd.read_excel(item_file)
 except Exception as e:
-    st.error(f"Failed to read files: {e}")
+    st.error(f"Failed to read uploaded files: {e}")
     st.stop()
 
 vehicle_df.columns = vehicle_df.columns.str.strip()
 item_df.columns = item_df.columns.str.strip()
 item_df = clean_item_columns(item_df)
 
-# Ensure required columns
-required = ['location id','id','type','length','width','height','weight','quantity','stackable','maxStack']
-missing = [c for c in required if c not in item_df.columns]
+required_cols = ['location id','id','type','length','width','height','weight','quantity','stackable','maxStack']
+missing = [c for c in required_cols if c not in item_df.columns]
 if missing:
     st.error("Items file missing required columns: " + ", ".join(missing))
     st.stop()
 
-# ---------- Preview ----------
 st.subheader("Preview Data")
 st.write("Vehicles:")
 st.dataframe(vehicle_df.head(50))
 st.write("Items:")
 st.dataframe(item_df.head(50))
 
-# ---------- Units ----------
-st.subheader("Units & Conversion")
-LENGTH_UNIT = st.selectbox("Length unit", ['mm','cm','m'], index=0)
-conv = {'mm':1/1000,'cm':1/100,'m':1}[LENGTH_UNIT]
+# ---------------- Units ----------------
+st.subheader("Units & conversion")
+LENGTH_UNIT = st.selectbox("Select length unit", options=['mm','cm','m'], index=0)
+UNIT_CONVERSION = {'mm':1/1000.0,'cm':1/100.0,'m':1.0}
+conv = UNIT_CONVERSION[LENGTH_UNIT]
 st.info(f"Converting lengths to meters with factor {conv}")
 
-# Cast types
 item_df['stackable'] = item_df['stackable'].astype(str).str.upper().isin(['TRUE','1','YES','Y'])
 item_df['quantity'] = item_df['quantity'].astype(int)
-vehicle_df['count'] = vehicle_df['count'].astype(int) if 'count' in vehicle_df.columns else 1
+vehicle_df['count'] = vehicle_df.get('count',1)
 
-# ---------- Geocoding using Geoapify ----------
-st.subheader("Assign Coordinates")
+# ---------------- Location Assignment with Geoapify ----------------
+st.subheader("Assign coordinates to locations and DEPOT")
+
 ensure_session_state('location_coords', {})
 ensure_session_state('location_names', {})
 
-GEO_API_KEY = "YOUR_GEOAPIFY_API_KEY"  # <-- paste your key here
+GEOAPI_KEY = "YOUR_GEOAPIFY_API_KEY"  # <-- Paste your Geoapify key here
 
-@st.cache_data(show_spinner=False)
-def geoapify_suggest(query):
+@st.cache_data
+def geocode(query):
+    """Call Geoapify autocomplete + geocode and return first lat/lon."""
+    if not query: return None
+    url = "https://api.geoapify.com/v1/geocode/autocomplete"
+    params = {"text": query, "limit":1, "apiKey":GEOAPI_KEY}
     try:
-        r = requests.get(
-            "https://api.geoapify.com/v1/geocode/autocomplete",
-            params={"text": query, "limit": 5, "apiKey": GEO_API_KEY, "type": "city"}
-        )
+        r = requests.get(url, params=params, timeout=5)
+        r.raise_for_status()
         data = r.json()
-        if 'features' in data:
-            return [(f"{f['properties'].get('city','')}, {f['properties'].get('state','')}, {f['properties'].get('country','')}",
-                     f['properties']['lat'], f['properties']['lon']) for f in data['features']]
-        return []
-    except Exception as e:
-        return []
+        if data['features']:
+            f = data['features'][0]['properties']
+            return f['lat'], f['lon'], f.get('formatted', query)
+        return None
+    except Exception:
+        return None
 
-unique_locs = sorted(item_df['location id'].unique())
-unique_locs_display = unique_locs.copy()
-
-for lid in unique_locs_display + ['DEPOT']:
-    with st.expander(f"Location: {lid}", expanded=True):
+unique_locs = sorted(item_df['location id'].unique().tolist())
+for lid in unique_locs + ['DEPOT']:
+    with st.expander(f"Location: {lid}"):
         name = st.session_state['location_names'].get(lid,'')
-        query = st.text_input(f"Search {lid}", value=name, key=f"search_{lid}")
-        suggestions = geoapify_suggest(query) if query else []
-        for display, lat, lon in suggestions:
-            if st.button(f"Select: {display}", key=f"sel_{lid}_{display}"):
+        query = st.text_input(f"Search address for {lid}", value=name, key=f"search_{lid}")
+        if st.button(f"Geocode {lid}", key=f"geo_{lid}"):
+            res = geocode(query)
+            if res:
+                lat, lon, addr = res
                 st.session_state['location_coords'][lid] = (lat, lon)
-                st.session_state['location_names'][lid] = display
-                st.success(f"Assigned {display}")
+                st.session_state['location_names'][lid] = addr
+                st.success(f"Found: {addr} ({lat:.4f}, {lon:.4f})")
+            else:
+                st.warning("No suggestions or API error. Try a different query.")
+        if lid in st.session_state['location_coords']:
+            lat, lon = st.session_state['location_coords'][lid]
+            st.write(f"Coordinates — lat: {lat:.6f}, lon: {lon:.6f}")
 
-# Check coords
+# Ensure all locations have coordinates
 missing_coords = [l for l in unique_locs + ['DEPOT'] if l not in st.session_state['location_coords']]
 if missing_coords:
-    st.warning(f"Missing coordinates: {missing_coords}. Assign them to continue.")
+    st.warning(f"Coordinates missing for: {missing_coords}. Assign them to continue.")
     st.stop()
 
-# ---------- Show Map ----------
+# ---------------- Map ----------------
 st.subheader("Locations Map")
 all_coords = list(st.session_state['location_coords'].values())
 center_lat = np.mean([c[0] for c in all_coords])
 center_lon = np.mean([c[1] for c in all_coords])
-m = folium.Map(location=[center_lat, center_lon], zoom_start=6)
-for lid, (lat, lon) in st.session_state['location_coords'].items():
-    folium.Marker([lat, lon], popup=f"{lid}: {st.session_state['location_names'][lid]}").add_to(m)
-st_folium(m, width=900, height=500)
+map_object = folium.Map(location=[center_lat, center_lon], zoom_start=6, tiles='CartoDB positron')
+for lid,(lat,lon) in st.session_state['location_coords'].items():
+    folium.Marker([lat,lon], popup=f"{lid}: {st.session_state['location_names'].get(lid,'')}", tooltip=str(lid)).add_to(map_object)
+st_folium(map_object, width=900, height=500)
 
-# ---------- Distance matrix ----------
-loc_ids = sorted([l for l in st.session_state['location_coords'].keys() if l!='DEPOT'])
+# ---------------- Distance Matrix ----------------
+loc_ids = sorted([k for k in st.session_state['location_coords'] if k != 'DEPOT'])
 all_ids = loc_ids + ['DEPOT']
 coords = [st.session_state['location_coords'][lid] for lid in all_ids]
 N = len(coords)
 dist_mat = np.zeros((N,N), dtype=int)
-for i,(lat1,lon1) in enumerate(coords):
-    for j,(lat2,lon2) in enumerate(coords):
-        dist_mat[i,j] = int(haversine_distance(lat1,lon1,lat2,lon2))
+for i in range(N):
+    lat1, lon1 = coords[i]
+    for j in range(N):
+        lat2, lon2 = coords[j]
+        dist_mat[i,j] = int(haversine_distance(lat1, lon1, lat2, lon2))
 
-# ---------- Expand items ----------
+# ---------------- Expand Items ----------------
 pack_units = []
 for _, row in item_df.iterrows():
     loc = row['location id']
     item_id = row['id']
-    L = float(row['length']) * conv
-    W = float(row['width']) * conv
-    H = float(row['height']) * conv
+    L = float(row['length'])*conv
+    W = float(row['width'])*conv
+    H = float(row['height'])*conv
     weight = float(row['weight'])
     qty = int(row['quantity'])
     stackable = bool(row['stackable'])
     max_stack = int(row['maxStack']) if not pd.isna(row['maxStack']) else 1
-    if stackable and max_stack>1:
-        fullstacks = qty//max_stack
+    if stackable and max_stack > 1:
+        full = qty//max_stack
         rem = qty%max_stack
-        for _ in range(fullstacks):
+        for _ in range(full):
             pack_units.append({'location id':loc,'item_id':item_id,'length_m':L,'width_m':W,'height_m':H*max_stack,'weight_kg':weight*max_stack,'count':max_stack})
         if rem>0:
             pack_units.append({'location id':loc,'item_id':item_id,'length_m':L,'width_m':W,'height_m':H*rem,'weight_kg':weight*rem,'count':rem})
     else:
         for _ in range(qty):
             pack_units.append({'location id':loc,'item_id':item_id,'length_m':L,'width_m':W,'height_m':H,'weight_kg':weight,'count':1})
+
 pack_df = pd.DataFrame(pack_units)
 pack_df['volume_m3'] = pack_df['length_m']*pack_df['width_m']*pack_df['height_m']
+st.subheader(f"Created {len(pack_df)} pack-units")
+st.dataframe(pack_df.head(50))
 
-# ---------- Instantiate vehicles ----------
+# ---------------- Instantiate Vehicles ----------------
 vehicle_instances = []
 for _, v in vehicle_df.iterrows():
     for i in range(int(v.get('count',1))):
         inst = {
-            'vehicle_type': v.get('vehicle_type', v.get('vehicle_id', f"veh_{_}")),
+            'vehicle_type': v.get('vehicle_id', f"veh_{_}"),
             'length_m': float(v.get('length',0))*conv,
             'width_m': float(v.get('width',0))*conv,
             'height_m': float(v.get('height',0))*conv,
-            'max_load_kg': float(v.get('max_load', v.get('max_load_kg',0))),
-            'id': f"{v.get('vehicle_type', v.get('vehicle_id','veh'))}_{i+1}"
+            'max_load_kg': float(v.get('max_load',0)),
+            'id': f"{v.get('vehicle_id','veh')}_{i+1}"
         }
         inst['volume_m3'] = inst['length_m']*inst['width_m']*inst['height_m']
         vehicle_instances.append(inst)
-if not vehicle_instances:
-    st.error("No vehicles instantiated"); st.stop()
 
-# ---------- Bin packing (multi-vehicle split) ----------
-st.subheader("Bin Packing Assignments")
+# ---------------- Bin Packing (greedy, multi-vehicle for oversize items) ----------------
 vehicle_state = {v['id']:{'remaining_vol':v['volume_m3'],'remaining_wt':v['max_load_kg'],'vehicle':v,'assigned_packs':[]} for v in vehicle_instances}
-for p in pack_df.to_dict('records'):
-    qty_left = p['count']
-    while qty_left>0:
-        placed=False
-        v_order = sorted(vehicle_state.items(), key=lambda kv: kv[1]['remaining_vol'], reverse=True)
-        for vid, stt in v_order:
-            cap_count = min(qty_left,
-                            int(stt['remaining_vol']/p['volume_m3']) if p['volume_m3']>0 else qty_left,
-                            int(stt['remaining_wt']/p['weight_kg']) if p['weight_kg']>0 else qty_left)
-            if cap_count>0:
-                stt['assigned_packs'].append((p['location id'], {**p,'count':cap_count}))
-                stt['remaining_vol']-=p['volume_m3']*cap_count
-                stt['remaining_wt']-=p['weight_kg']*cap_count
-                qty_left-=cap_count
+assignments = {}
+
+for loc, group in pack_df.groupby('location id'):
+    packs = group.sort_values('volume_m3', ascending=False).to_dict('records')
+    for p in packs:
+        placed = False
+        # Try to place in any vehicle
+        for vid, stt in sorted(vehicle_state.items(), key=lambda kv: kv[1]['remaining_vol'], reverse=True):
+            if stt['remaining_vol']+1e-9 >= p['volume_m3'] and stt['remaining_wt']+1e-9 >= p['weight_kg']:
+                stt['assigned_packs'].append((loc,p))
+                stt['remaining_vol'] -= p['volume_m3']
+                stt['remaining_wt'] -= p['weight_kg']
+                assignments.setdefault(vid,[]).append(loc)
                 placed=True
                 break
         if not placed:
-            st.warning(f"Item {p['item_id']} at {p['location id']} too big for any vehicle. Qty left: {qty_left}")
-            break
+            st.warning(f"Item {p['item_id']} at {loc} could not fit in any vehicle!")
 
-# ---------- VRP ----------
-st.subheader("VRP Model & Solution")
-location_idx_map = {loc:i for i, loc in enumerate(all_ids)}
+used_vehicles = [v for v in vehicle_state.values() if v['assigned_packs']]
+st.subheader(f"Vehicles used: {len(used_vehicles)}")
+for vid, stt in vehicle_state.items():
+    if stt['assigned_packs']:
+        locs = sorted(set([x[0] for x in stt['assigned_packs']]))
+        used_vol = stt['vehicle']['volume_m3'] - stt['remaining_vol']
+        used_wt = stt['vehicle']['max_load_kg'] - stt['remaining_wt']
+        st.write(f"{vid} visits {locs}, used_vol={used_vol:.3f}m3, used_wt={used_wt:.1f}kg")
+
+# ---------------- OR-Tools VRP ----------------
+location_idx_map = {loc:i for i,loc in enumerate(all_ids)}
 num_nodes = len(all_ids)
 demand_weight = np.zeros(num_nodes, dtype=int)
 demand_volume = np.zeros(num_nodes, dtype=int)
-for stt in vehicle_state.values():
-    for loc, p in stt['assigned_packs']:
-        idx = location_idx_map[loc]
-        demand_weight[idx]+=int(math.ceil(p['weight_kg']))
-        demand_volume[idx]+=int(math.ceil(p['volume_m3']*1000))
-vehicle_ids = list(vehicle_state.keys())
-vehicle_cap_wt = [int(stt['vehicle']['max_load_kg']) for stt in vehicle_state.values()]
-vehicle_cap_vol=[int(stt['vehicle']['volume_m3']*1000) for stt in vehicle_state.values()]
 
-manager = pywrapcp.RoutingIndexManager(num_nodes,len(vehicle_ids),location_idx_map['DEPOT'])
+for stt in vehicle_state.values():
+    for loc,p in stt['assigned_packs']:
+        idx = location_idx_map[loc]
+        demand_weight[idx] += int(math.ceil(p['weight_kg']))
+        demand_volume[idx] += int(math.ceil(p['volume_m3']*1000))
+
+vehicle_ids = list(vehicle_state.keys())
+vehicle_cap_wt = [int(vs['vehicle']['max_load_kg']) for vs in vehicle_state.values()]
+vehicle_cap_vol = [int(vs['vehicle']['volume_m3']*1000) for vs in vehicle_state.values()]
+
+manager = pywrapcp.RoutingIndexManager(num_nodes, len(vehicle_ids), location_idx_map['DEPOT'])
 routing = pywrapcp.RoutingModel(manager)
 cost_matrix = dist_mat.tolist()
+
 def distance_callback(i,j):
-    return int(cost_matrix[manager.IndexToNode(i)][manager.IndexToNode(j)])
+    ni = manager.IndexToNode(i)
+    nj = manager.IndexToNode(j)
+    return int(cost_matrix[ni][nj])
 transit_cb_idx = routing.RegisterTransitCallback(distance_callback)
 routing.SetArcCostEvaluatorOfAllVehicles(transit_cb_idx)
-# Weight dimension
-def demand_wt_cb(idx):
-    node=manager.IndexToNode(idx)
-    return 0 if node==location_idx_map['DEPOT'] else int(demand_weight[node])
-routing.AddDimensionWithVehicleCapacity(routing.RegisterUnaryTransitCallback(demand_wt_cb),0,vehicle_cap_wt,True,'Weight')
-# Volume dimension
-def demand_vol_cb(idx):
-    node=manager.IndexToNode(idx)
-    return 0 if node==location_idx_map['DEPOT'] else int(demand_volume[node])
-routing.AddDimensionWithVehicleCapacity(routing.RegisterUnaryTransitCallback(demand_vol_cb),0,vehicle_cap_vol,True,'Volume')
-# Solve
+
+# Weight & Volume dimensions
+routing.AddDimensionWithVehicleCapacity(
+    routing.RegisterUnaryTransitCallback(lambda idx: 0 if manager.IndexToNode(idx)==location_idx_map['DEPOT'] else demand_weight[manager.IndexToNode(idx)]),
+    0, vehicle_cap_wt, True, 'Weight'
+)
+routing.AddDimensionWithVehicleCapacity(
+    routing.RegisterUnaryTransitCallback(lambda idx: 0 if manager.IndexToNode(idx)==location_idx_map['DEPOT'] else demand_volume[manager.IndexToNode(idx)]),
+    0, vehicle_cap_vol, True, 'Volume'
+)
+
 search_params = pywrapcp.DefaultRoutingSearchParameters()
 search_params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
 search_params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
 search_params.time_limit.seconds = 30
+
 solution = routing.SolveWithParameters(search_params)
 if not solution:
-    st.error("No VRP solution found"); st.stop()
+    st.error("No VRP solution found")
+    st.stop()
 
-# ---------- Extract routes + distances ----------
+# ---------------- Extract Routes ----------------
 solution_routes = {}
-total_distance = {}
+total_distances = {}
 for v_idx, vid in enumerate(vehicle_ids):
     index = routing.Start(v_idx)
-    route=[]
-    dist=0
+    route = []
+    dist = 0
     while not routing.IsEnd(index):
-        node=manager.IndexToNode(index)
-        if node!=location_idx_map['DEPOT']:
-            route.append(all_ids[node])
+        node = manager.IndexToNode(index)
+        if node != location_idx_map['DEPOT']:
+            loc_id = all_ids[node]
+            route.append(loc_id)
         next_index = solution.Value(routing.NextVar(index))
-        dist+=routing.GetArcCostForVehicle(index,next_index,v_idx)
-        index=next_index
-    solution_routes[vid]=route
-    total_distance[vid]=dist
+        if next_index != index:
+            dist += distance_callback(index,next_index)
+        index = next_index
+    solution_routes[vid] = route
+    total_distances[vid] = dist/1000.0  # km
 
-st.success("Routing solved")
-for vid,r in solution_routes.items():
-    st.write(f"{vid}: Route {r}, Distance {total_distance[vid]/1000:.2f} km")
+st.subheader("VRP Routes & Distances")
+for v, r in solution_routes.items():
+    if r:
+        st.write(f"{v} -> {r}, total distance: {total_distances[v]:.2f} km")
 
-# ---------- Map Visualization with vehicle-type coloring ----------
-st.subheader("Route Map")
-m = folium.Map(location=[np.mean([c[0] for c in coords]),np.mean([c[1] for c in coords])], zoom_start=6)
-vehicle_types = list({v['vehicle_type'] for v in vehicle_instances})
-type_colors = {vtype: color for vtype, color in zip(vehicle_types, ['#1f77b4','#ff7f0e','#2ca02c','#d62728','#9467bd','#8c564b','#e377c2','#7f7f7f','#bcbd22'])}
-for i,(vid,route_locs) in enumerate(solution_routes.items()):
-    color = type_colors[vehicle_state[vid]['vehicle']['vehicle_type']]
-    route_coords=[st.session_state['location_coords']['DEPOT']]
+# ---------------- Visualization ----------------
+st.subheader("Route Visualization")
+all_lats = [st.session_state['location_coords']['DEPOT'][0]]
+all_lons = [st.session_state['location_coords']['DEPOT'][1]]
+for route_locs in solution_routes.values():
     for loc in route_locs:
-        lat,lon=st.session_state['location_coords'][loc]
+        lat,lon = st.session_state['location_coords'][loc]
+        all_lats.append(lat)
+        all_lons.append(lon)
+center_lat = float(np.mean(all_lats))
+center_lon = float(np.mean(all_lons))
+
+m = folium.Map(location=[center_lat,center_lon], zoom_start=7, tiles='CartoDB positron')
+colors = ['#1f77b4','#ff7f0e','#2ca02c','#d62728','#9467bd','#8c564b','#e377c2','#7f7f7f','#bcbd22']
+
+for i,(veh,route_locs) in enumerate(solution_routes.items()):
+    if not route_locs: continue
+    color = colors[i % len(colors)]
+    route_coords = [st.session_state['location_coords']['DEPOT']]
+    for loc in route_locs:
+        lat,lon = st.session_state['location_coords'][loc]
         route_coords.append((lat,lon))
-        folium.CircleMarker(location=[lat,lon],radius=6,color=color,fill=True,fill_color=color,fill_opacity=0.9,
-                            popup=f"{loc}\nVehicle: {vid}",tooltip=str(loc)).add_to(m)
+        folium.CircleMarker(
+            location=[lat,lon],
+            radius=6,
+            color=color,
+            fill=True,
+            fill_color=color,
+            fill_opacity=0.9,
+            popup=f"{loc} ({lat:.4f},{lon:.4f})\nVehicle: {veh}",
+            tooltip=str(loc)
+        ).add_to(m)
     route_coords.append(st.session_state['location_coords']['DEPOT'])
     folium.PolyLine(route_coords,color=color,weight=3,opacity=0.8).add_to(m)
-st_folium(m,width=900,height=600)
+    folium.map.Marker(route_coords[1], icon=folium.DivIcon(html=f"<div style='font-size:12pt;color:{color};font-weight:bold'>{veh}</div>")).add_to(m)
 
-# ---------- Download ----------
-st.subheader("Export Results")
-rows=[]
+dlat,dlon = st.session_state['location_coords']['DEPOT']
+folium.Marker([dlat,dlon], popup="DEPOT", tooltip="DEPOT", icon=folium.Icon(color='black', icon='home')).add_to(m)
+
+st_folium(m, width=900, height=600)
+
+# ---------------- Download Results ----------------
+st.subheader("Export Assignments CSV")
+rows = []
 for vid, stt in vehicle_state.items():
-    for loc, p in stt['assigned_packs']:
-        rows.append({'vehicle_id':vid,'location':loc,'item_id':p['item_id'],'count':p['count'],'weight_kg':p['weight_kg'],'volume_m3':p['volume_m3']})
-assign_df=pd.DataFrame(rows)
-if not assign_df.empty:
-    csv=assign_df.to_csv(index=False).encode('utf-8')
-    st.download_button("Download CSV",data=csv,file_name='assignments.csv',mime='text/csv')
-
+    for loc,p in stt['assigned_packs']:
+        rows.append({'vehicle_id':vid,'location':loc,'item
