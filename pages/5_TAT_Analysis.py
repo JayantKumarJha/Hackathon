@@ -31,7 +31,7 @@ import plotly.express as px
 # We'll attempt to read using openpyxl first, then xlrd. If both unavailable, user will see clear message.
 
 st.set_page_config(page_title="TAT Breach Analysis", page_icon="⏱️", layout="wide")
-st.title("⏱️ TAT Breach — Quality (BAVLA)")
+st.title("⏱️ TAT Breach Analysis")
 st.caption("Filter by MatType and date range. TAT Deadline = Testing Slip Date + 17 days. Weekly breach % uses requests (Testing Slip) week.")
 
 # ----------------- canonical column names (exact as you asked) -----------------
