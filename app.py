@@ -14,7 +14,7 @@ import streamlit as st
 
 # Page config
 st.set_page_config(
-    page_title="Welcome to SWISS",
+    page_title="Welcome to GCPL",
     page_icon="💊",
     layout="centered"
 )
@@ -48,8 +48,8 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # Title
-st.markdown("<div class='title'>👋 Welcome to <span style='color:#2980b9'>SWISS</span></div>", unsafe_allow_html=True)
-st.markdown("<div class='subtitle'>Your Smart Production Scheduling Platform</div>", unsafe_allow_html=True)
+st.markdown("<div class='title'>👋 Welcome to <span style='color:#2980b9'>GCPL</span></div>", unsafe_allow_html=True)
+st.markdown("<div class='subtitle'>Your Smart Opreations Platform</div>", unsafe_allow_html=True)
 
 # Info Card
 st.markdown("""
