@@ -187,7 +187,6 @@ for i in range(N):
         lat2, lon2 = coords[j]
         dist_mat[i,j] = int(haversine_distance(lat1, lon1, lat2, lon2))
 
-# Expand items into pack units
 pack_units = []
 for _, row in item_df.iterrows():
     loc = row['location id']
@@ -211,7 +210,7 @@ for _, row in item_df.iterrows():
             pack_units.append({'location id': loc,'item_id': item_id,'length_m': L,'width_m': W,'height_m': H,'weight_kg': weight,'count': 1})
 
 pack_df = pd.DataFrame(pack_units)
-pack_df['volume_m3'] = pack_df['length_m'] * pack_df['width_m'] * pack_df['height_m']
+pack_df['volume_m3'] = pack_df['length_m']*pack_df['width_m']*pack_df['height_m']
 
 # -------------------------- Instantiate vehicles --------------------------
 st.subheader("Instantiate vehicle instances")
@@ -230,16 +229,28 @@ for _, v in vehicle_df.iterrows():
         inst['volume_m3'] = inst['length_m']*inst['width_m']*inst['height_m']
         vehicle_instances.append(inst)
 
-# -------------------------- Bin Packing --------------------------
+# -------------------------- Bin Packing with max check --------------------------
 st.subheader("Bin packing (assign packs to vehicles)")
-vehicle_state = {v['id']:{'remaining_vol':v['volume_m3'],'remaining_wt':v['max_load_kg'],'vehicle':v,'assigned_packs':[]} for v in vehicle_instances}
+
+vehicle_state = {v['id']: {
+    'remaining_vol': v['volume_m3'],
+    'remaining_wt': v['max_load_kg'],
+    'vehicle': v,
+    'assigned_packs': []
+} for v in vehicle_instances}
+
+max_vol = max(v['volume_m3'] for v in vehicle_instances)
+max_wt = max(v['max_load_kg'] for v in vehicle_instances)
 
 grouped = pack_df.groupby('location id')
-assignments = {}
 for loc, group in grouped:
     packs = group.sort_values('volume_m3', ascending=False).to_dict('records')
-    packs_left = packs.copy()
-    for p in packs_left:
+    for p in packs:
+        # Check if pack can fit into any vehicle at all
+        if p['volume_m3'] > max_vol or p['weight_kg'] > max_wt:
+            st.error(f"Item {p['item_id']} at location {loc} is too large/heavy to fit into any truck. Skipping.")
+            continue
+
         placed = False
         v_order = sorted(vehicle_state.items(), key=lambda kv: kv[1]['remaining_vol'], reverse=True)
         for vid, stt in v_order:
@@ -247,14 +258,14 @@ for loc, group in grouped:
                 stt['assigned_packs'].append((loc, p))
                 stt['remaining_vol'] -= p['volume_m3']
                 stt['remaining_wt'] -= p['weight_kg']
-                assignments.setdefault(vid, []).append(loc)
                 placed = True
                 break
         if not placed:
-            st.warning(f"Could not place pack for location {loc}, item {p['item_id']}.")
+            st.warning(f"Item {p['item_id']} at location {loc} could not fit into any truck with remaining capacity.")
 
 # -------------------------- VRP --------------------------
 st.subheader("Create VRP model and solve (OR-Tools)")
+
 location_idx_map = {loc:i for i, loc in enumerate(all_ids)}
 num_nodes = len(all_ids)
 
@@ -347,11 +358,12 @@ for i,(veh, route_locs) in enumerate(solution_routes.items()):
                             popup=f"{loc} ({lat:.4f},{lon:.4f})\nVehicle: {veh}", tooltip=str(loc)).add_to(m)
     route_coords.append(st.session_state['location_coords']['DEPOT'])
     folium.PolyLine(route_coords,color=color,weight=3,opacity=0.8).add_to(m)
-    folium.map.Marker(route_coords[1],icon=folium.DivIcon(html=f"<div style='font-size:12pt;color:{color};font-weight:bold'>{veh}</div>")).add_to(m)
+    folium.map.Marker(route_coords[1], icon=folium.DivIcon(html=f"<div style='font-size:12pt;color:{color};font-weight:bold'>{veh}</div>")).add_to(m)
 
-# depot marker
+# depot
 dlat, dlon = st.session_state['location_coords']['DEPOT']
-folium.Marker([dlat, dlon], popup="DEPOT", tooltip="DEPOT", icon=folium.Icon(color='black', icon='home')).add_to(m)
+folium.Marker([dlat,dlon], popup="DEPOT", tooltip="DEPOT", icon=folium.Icon(color='black',icon='home')).add_to(m)
+
 st_folium(m,width=900,height=600)
 
 # -------------------------- Export --------------------------
@@ -365,5 +377,5 @@ if not assign_df.empty:
     csv = assign_df.to_csv(index=False).encode('utf-8')
     st.download_button('Download assignments CSV', data=csv, file_name='assignments.csv', mime='text/csv')
 
-st.info('Page 6 complete.')
+st.info('Page 6 complete. Copy this file into your Streamlit multipage app.')
 
