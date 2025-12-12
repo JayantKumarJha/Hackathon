@@ -9,27 +9,54 @@ Original file is located at
 
 # app/pages/6_🚚_Bin_Packing_&_Routing.py
 
+# pages/6_Vehicle_Routing.py
 import streamlit as st
 import pandas as pd
 import numpy as np
 import folium
 from streamlit_folium import st_folium
-from geopy.geocoders import Nominatim
+import requests
 import time, math, warnings
 from ortools.constraint_solver import routing_enums_pb2, pywrapcp
 
 warnings.filterwarnings('ignore')
 
 # --------------------------
-# Streamlit Page 6 — Bin Packing + Vehicle Routing
-# Single-file page you can paste into your GitHub Streamlit app as page 6
+# Streamlit Page 6 — Bin Packing + Vehicle Routing (with Geoapify Autocomplete)
 # --------------------------
 
 st.set_page_config(layout='wide')
 st.title("Page 6 — Bin Packing + Vehicle Routing (VRP)")
-st.markdown("Upload your vehicle & item files, assign coordinates to locations and depot, run packing and routing, and visualise the routes.")
+st.markdown(
+    "Upload your vehicle & item files, assign coordinates to locations and depot using Geoapify autocomplete, "
+    "run packing and routing, and visualise the routes."
+)
 
-# ---------- Helpers ----------
+# --------------------------
+# Config: where to get Geoapify key
+# - Preferred: put in Streamlit secrets as [geoapify] api_key = \"YOUR_KEY\"
+# - Fallback: enter manually in the textbox below (not recommended for production)
+# --------------------------
+
+def get_geoapify_key():
+    # preferred: use st.secrets
+    try:
+        api_key = st.secrets["geoapify"]["api_key"]
+        if api_key and isinstance(api_key, str):
+            return api_key
+    except Exception:
+        pass
+    # fallback: manual entry
+    return st.text_input("Geoapify API key (or store it in Streamlit Secrets)", type="password")
+
+GEOAPIFY_KEY = get_geoapify_key()
+if not GEOAPIFY_KEY:
+    st.warning("Geoapify API key required. Add it in Streamlit Secrets or paste in the input above.")
+    st.stop()
+
+# --------------------------
+# Helpers
+# --------------------------
 
 def clean_item_columns(df: pd.DataFrame) -> pd.DataFrame:
     mapping = {
@@ -65,7 +92,61 @@ def ensure_session_state(key, default):
         st.session_state[key] = default
 
 
-# ---------- UI: Upload ----------
+# --------------------------
+# Geoapify API calls (cached)
+# --------------------------
+
+@st.cache_data(show_spinner=False)
+def geoapify_autocomplete(query: str, api_key: str, limit: int = 6):
+    """Return a list of candidate dicts from Geoapify autocomplete endpoint."""
+    if not query or not api_key:
+        return []
+    url = "https://api.geoapify.com/v1/geocode/autocomplete"
+    params = {"text": query, "limit": limit, "apiKey": api_key}
+    try:
+        r = requests.get(url, params=params, timeout=8)
+        r.raise_for_status()
+        data = r.json()
+        results = data.get("results", [])
+        candidates = []
+        for res in results:
+            # Each result provides lat, lon and formatted address
+            candidates.append({
+                "formatted": res.get("formatted", res.get("display_name", "")),
+                "lat": res.get("lat"),
+                "lon": res.get("lon"),
+                "country": res.get("country"),
+                "city": res.get("city") or res.get("county") or res.get("state")
+            })
+        return candidates
+    except Exception:
+        # On error return empty list (caller will show message)
+        return []
+
+
+@st.cache_data(show_spinner=False)
+def geoapify_forward_search(query: str, api_key: str, limit: int = 1):
+    """Return the best candidate from Geoapify forward geocode search."""
+    if not query or not api_key:
+        return None
+    url = "https://api.geoapify.com/v1/geocode/search"
+    params = {"text": query, "limit": limit, "apiKey": api_key}
+    try:
+        r = requests.get(url, params=params, timeout=8)
+        r.raise_for_status()
+        data = r.json()
+        results = data.get("results", [])
+        if not results:
+            return None
+        res = results[0]
+        return {"formatted": res.get("formatted", res.get("display_name", "")), "lat": res.get("lat"), "lon": res.get("lon")}
+    except Exception:
+        return None
+
+
+# --------------------------
+# UI: Upload
+# --------------------------
 col1, col2 = st.columns([1, 1])
 with col1:
     veh_file = st.file_uploader("Vehicle file (CSV or XLSX)", type=['csv', 'xlsx'], key='veh')
@@ -76,7 +157,9 @@ if not (veh_file and item_file):
     st.info("Upload both vehicle and item files to proceed. Example columns described in the original Colab code are expected.")
     st.stop()
 
-# ---------- Load Data ----------
+# --------------------------
+# Load Data
+# --------------------------
 try:
     if veh_file.name.endswith('.csv'):
         vehicle_df = pd.read_csv(veh_file)
@@ -126,64 +209,89 @@ else:
     # assume 1 of each vehicle row if missing
     vehicle_df['count'] = 1
 
-# ---------- Location assignment (streamlit form) ----------
-st.subheader("Assign coordinates to each location and DEPOT")
+# --------------------------
+# Location assignment (autocomplete UI for each location)
+# --------------------------
+st.subheader("Assign coordinates to each location and DEPOT (Geoapify autocomplete)")
 
-# Prepare location list
 unique_locs = sorted(item_df['location id'].unique().tolist())
-unique_locs_display = unique_locs.copy()
-
 ensure_session_state('location_coords', {})
 ensure_session_state('location_names', {})
 
-geolocator = Nominatim(user_agent="streamlit_vrp_app", timeout=5)
+st.markdown(
+    "For each Location ID: type a place/address fragment and click **Suggest** → choose the best match from the dropdown → click **Use selection**."
+)
+st.markdown("This uses Geoapify autocomplete and caches results to avoid repeated API calls.")
 
-loc_cols = st.columns([2,1,1,1])
-for lid in unique_locs_display:
+for lid in unique_locs:
     with st.expander(f"Location: {lid}", expanded=False):
-        coords = st.session_state['location_coords'].get(lid, None)
-        name = st.session_state['location_names'].get(lid, '')
-        col_a, col_b = st.columns([3,1])
+        # current values
+        current = st.session_state['location_coords'].get(lid, None)
+        current_name = st.session_state['location_names'].get(lid, "")
+        col_a, col_b = st.columns([3, 1])
         with col_a:
-            query = st.text_input(f"Search address for {lid}", value=name, key=f"search_{lid}")
+            query_key = f"query_{lid}"
+            query_val = st.text_input(f"Type address/place for {lid}", value=current_name or "", key=query_key)
         with col_b:
-            if st.button(f"Geocode {lid}", key=f"geocode_{lid}"):
-                try:
-                    time.sleep(1.1)
-                    res = geolocator.geocode(query, exactly_one=True)
-                    if res:
-                        st.session_state['location_coords'][lid] = (res.latitude, res.longitude)
-                        st.session_state['location_names'][lid] = res.address
-                        st.success(f"Found: {res.address} ({res.latitude:.4f}, {res.longitude:.4f})")
-                    else:
-                        st.warning("No result from geocoder — try a different query")
-                except Exception as e:
-                    st.error(f"Geocoding error: {e}")
-        # show current coords if exist
+            if st.button("Suggest", key=f"suggest_{lid}"):
+                # call cached autocomplete
+                suggestions = geoapify_autocomplete(query_val, GEOAPIFY_KEY, limit=8)
+                if not suggestions:
+                    st.warning("No suggestions found or API error. Try a different query.")
+                    st.session_state[f"suggestions_{lid}"] = []
+                else:
+                    st.session_state[f"suggestions_{lid}"] = suggestions
+
+        # show select box if suggestions exist
+        suggestions = st.session_state.get(f"suggestions_{lid}", [])
+        if suggestions:
+            options = [f"{s['formatted']} ({s['lat']:.6f},{s['lon']:.6f})" for s in suggestions]
+            sel_index = st.selectbox("Choose match", options=options, key=f"select_{lid}")
+            # show a preview & a button to use selection
+            if st.button("Use selection", key=f"use_{lid}"):
+                # find selected item
+                idx = options.index(sel_index)
+                sel = suggestions[idx]
+                st.session_state['location_coords'][lid] = (float(sel['lat']), float(sel['lon']))
+                st.session_state['location_names'][lid] = sel['formatted']
+                st.success(f"Assigned {lid} → {sel['formatted']} ({sel['lat']:.6f}, {sel['lon']:.6f})")
+                # clear suggestions for cleanliness
+                st.session_state[f"suggestions_{lid}"] = []
+
+        # quick show current coordinates
         if lid in st.session_state['location_coords']:
             lat, lon = st.session_state['location_coords'][lid]
             st.write(f"Coordinates — lat: {lat:.6f}, lon: {lon:.6f}")
 
 # DEPOT
 with st.expander("DEPOT (required)"):
-    dep_query = st.text_input("Search address for DEPOT", value=st.session_state['location_names'].get('DEPOT',''), key='search_DEPOT')
-    if st.button("Geocode DEPOT", key='geocode_DEPOT'):
-        try:
-            time.sleep(1.1)
-            res = geolocator.geocode(dep_query, exactly_one=True)
-            if res:
-                st.session_state['location_coords']['DEPOT'] = (res.latitude, res.longitude)
-                st.session_state['location_names']['DEPOT'] = res.address
-                st.success(f"Depot: {res.address} ({res.latitude:.4f}, {res.longitude:.4f})")
-            else:
-                st.warning("No result for depot — try a different query")
-        except Exception as e:
-            st.error(f"Geocoding error: {e}")
+    dep_key = "query_DEPOT"
+    dep_query = st.text_input("Type address/place for DEPOT", value=st.session_state['location_names'].get('DEPOT',''), key=dep_key)
+    if st.button("Suggest DEPOT", key="suggest_DEPOT"):
+        suggestions = geoapify_autocomplete(dep_query, GEOAPIFY_KEY, limit=8)
+        if not suggestions:
+            st.warning("No suggestions found or API error. Try a different query.")
+            st.session_state["suggestions_DEPOT"] = []
+        else:
+            st.session_state["suggestions_DEPOT"] = suggestions
+
+    suggestions = st.session_state.get("suggestions_DEPOT", [])
+    if suggestions:
+        options = [f"{s['formatted']} ({s['lat']:.6f},{s['lon']:.6f})" for s in suggestions]
+        sel_index = st.selectbox("Choose DEPOT match", options=options, key="select_DEPOT")
+        if st.button("Use selection for DEPOT", key="use_DEPOT"):
+            idx = options.index(sel_index)
+            sel = suggestions[idx]
+            st.session_state['location_coords']['DEPOT'] = (float(sel['lat']), float(sel['lon']))
+            st.session_state['location_names']['DEPOT'] = sel['formatted']
+            st.success(f"Assigned DEPOT → {sel['formatted']} ({sel['lat']:.6f}, {sel['lon']:.6f})")
+            st.session_state["suggestions_DEPOT"] = []
+
     if 'DEPOT' in st.session_state['location_coords']:
         lat, lon = st.session_state['location_coords']['DEPOT']
         st.write(f"Depot coords — lat: {lat:.6f}, lon: {lon:.6f}")
 
-# Check if all locations have coords
+# Check coordinates exist
 missing_coords = [l for l in unique_locs if l not in st.session_state['location_coords']]
 if 'DEPOT' not in st.session_state['location_coords']:
     st.warning("Please set coordinates for the DEPOT to continue.")
@@ -201,12 +309,14 @@ center_lat = float(np.mean(all_lats))
 center_lon = float(np.mean(all_lons))
 map_object = folium.Map(location=[center_lat, center_lon], zoom_start=8, tiles='CartoDB positron')
 for lid, (lat, lon) in st.session_state['location_coords'].items():
-    folium.Marker([lat, lon], popup=f"{lid}: {st.session_state['location_names'].get(lid,'')}", tooltip=str(lid)).add_to(map_object)
+    popup_html = f"{lid}: {st.session_state['location_names'].get(lid,'')}"
+    folium.Marker([lat, lon], popup=popup_html, tooltip=str(lid)).add_to(map_object)
 st_folium(map_object, width=900, height=500)
 
-# ---------- Build distance matrix (Haversine) ----------
+# --------------------------
+# Build distance matrix (Haversine) & pack-units
+# --------------------------
 st.subheader("Build distance matrix & expand items into pack-units")
-# Determine order: all locations except depot, then depot last (this matches OR-Tools indexing used later)
 loc_ids = sorted([k for k in st.session_state['location_coords'].keys() if k != 'DEPOT'])
 all_ids = loc_ids + ['DEPOT']
 coords = [st.session_state['location_coords'][lid] for lid in all_ids]
@@ -221,7 +331,7 @@ for i in range(N):
 
 st.write(f"Distance matrix built for {N} nodes (meters)")
 
-# ---------- Expand items into pack units ----------
+# Expand items to pack units
 pack_units = []
 for _, row in item_df.iterrows():
     loc = row['location id']
@@ -249,7 +359,9 @@ pack_df['volume_m3'] = pack_df['length_m'] * pack_df['width_m'] * pack_df['heigh
 st.write(f"Created {len(pack_df)} pack-units from the items file")
 st.dataframe(pack_df.head(50))
 
-# ---------- Instantiate vehicles ----------
+# --------------------------
+# Instantiate vehicles
+# --------------------------
 st.subheader("Instantiate vehicle instances")
 vehicle_instances = []
 for _, v in vehicle_df.iterrows():
@@ -273,10 +385,11 @@ if not vehicle_instances:
 st.write(f"Instantiated {len(vehicle_instances)} vehicle instances")
 st.dataframe(pd.DataFrame(vehicle_instances))
 
-# ---------- Pack by location (greedy heuristic) ----------
+# --------------------------
+# Bin packing (greedy)
+# --------------------------
 st.subheader("Bin packing (assign packs to vehicles)")
 
-# initialize vehicle states
 vehicle_state = {v['id']:{'remaining_vol': v['volume_m3'],'remaining_wt': v['max_load_kg'],'vehicle':v,'assigned_packs':[]} for v in vehicle_instances}
 
 grouped = pack_df.groupby('location id')
@@ -322,13 +435,13 @@ for vid, stt in vehicle_state.items():
         used_wt = stt['vehicle']['max_load_kg'] - stt['remaining_wt']
         st.write(f"Vehicle {vid}: visits {assigned_locs}, used_vol={used_vol:.3f}m3, used_wt={used_wt:.1f}kg")
 
-# ---------- Build demands for OR-Tools ----------
+# --------------------------
+# VRP: build model & solve
+# --------------------------
 st.subheader("Create VRP model and solve (OR-Tools)")
 
-# Build mapping of location -> index consistent with distance matrix
 location_idx_map = {loc: i for i, loc in enumerate(all_ids)}
 num_nodes = len(all_ids)
-num_locations = num_nodes - 1  # excluding depot
 
 demand_weight = np.zeros(num_nodes, dtype=int)
 demand_volume = np.zeros(num_nodes, dtype=int)
@@ -339,7 +452,6 @@ for vid, stt in vehicle_state.items():
         demand_weight[idx] += int(math.ceil(p['weight_kg']))
         demand_volume[idx] += int(math.ceil(p['volume_m3'] * 1000))
 
-# Vehicle capacity arrays
 vehicle_ids = []
 vehicle_cap_wt = []
 vehicle_cap_vol = []
@@ -352,11 +464,9 @@ if len(vehicle_ids) == 0:
     st.error('No vehicles available for routing. Aborting')
     st.stop()
 
-# OR-Tools setup
 manager = pywrapcp.RoutingIndexManager(num_nodes, len(vehicle_ids), location_idx_map['DEPOT'])
 routing = pywrapcp.RoutingModel(manager)
 
-# cost matrix (distance)
 cost_matrix = dist_mat.tolist()
 
 def distance_callback(i, j):
@@ -367,7 +477,6 @@ def distance_callback(i, j):
 transit_callback_index = routing.RegisterTransitCallback(distance_callback)
 routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
 
-# Weight dimension
 def demand_weight_callback(index):
     node = manager.IndexToNode(index)
     return 0 if node == location_idx_map['DEPOT'] else int(demand_weight[node])
@@ -375,7 +484,6 @@ def demand_weight_callback(index):
 demand_wt_cb = routing.RegisterUnaryTransitCallback(demand_weight_callback)
 routing.AddDimensionWithVehicleCapacity(demand_wt_cb, 0, vehicle_cap_wt, True, 'Weight')
 
-# Volume dimension
 def demand_vol_callback(index):
     node = manager.IndexToNode(index)
     return 0 if node == location_idx_map['DEPOT'] else int(demand_volume[node])
@@ -383,7 +491,6 @@ def demand_vol_callback(index):
 demand_vol_cb = routing.RegisterUnaryTransitCallback(demand_vol_callback)
 routing.AddDimensionWithVehicleCapacity(demand_vol_cb, 0, vehicle_cap_vol, True, 'Volume')
 
-# Solver params
 search_params = pywrapcp.DefaultRoutingSearchParameters()
 search_params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
 search_params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
@@ -396,7 +503,6 @@ if not solution:
     st.error('No VRP solution found')
     st.stop()
 
-# Extract routes
 solution_routes = {}
 for v_idx, vid in enumerate(vehicle_ids):
     index = routing.Start(v_idx)
@@ -404,7 +510,6 @@ for v_idx, vid in enumerate(vehicle_ids):
     while not routing.IsEnd(index):
         node = manager.IndexToNode(index)
         if node != location_idx_map['DEPOT']:
-            # map node -> location id
             loc_id = all_ids[node]
             route.append(loc_id)
         index = solution.Value(routing.NextVar(index))
@@ -415,9 +520,10 @@ for v, r in solution_routes.items():
     if r:
         st.write(f"{v} -> {r}")
 
-# ---------- Visualization (folium) ----------
+# --------------------------
+# Visualization (folium)
+# --------------------------
 st.subheader("Route visualization")
-# center
 all_lats = [st.session_state['location_coords']['DEPOT'][0]]
 all_lons = [st.session_state['location_coords']['DEPOT'][1]]
 for route_locs in solution_routes.values():
@@ -429,8 +535,6 @@ center_lat = float(np.mean(all_lats))
 center_lon = float(np.mean(all_lons))
 
 m = folium.Map(location=[center_lat, center_lon], zoom_start=7, tiles='CartoDB positron')
-# add India bbox lightly for context if needed (kept optional)
-# folium.Rectangle(bounds=[[6.55,68.11],[35.67,97.39]], color='#cccccc', fill=True, fill_opacity=0.02).add_to(m)
 
 colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22']
 for i, (veh, route_locs) in enumerate(solution_routes.items()):
@@ -441,6 +545,7 @@ for i, (veh, route_locs) in enumerate(solution_routes.items()):
     for loc in route_locs:
         lat, lon = st.session_state['location_coords'][loc]
         route_coords.append((lat, lon))
+        popup_text = f"{loc} ({lat:.4f}, {lon:.4f})\\nVehicle: {veh}"
         folium.CircleMarker(
             location=[lat, lon],
             radius=6,
@@ -448,14 +553,15 @@ for i, (veh, route_locs) in enumerate(solution_routes.items()):
             fill=True,
             fill_color=color,
             fill_opacity=0.9,
-            popup=f"""{loc} ({lat:.4f}, {lon:.4f})
-Vehicle: {veh}""",
+            popup=popup_text,
             tooltip=str(loc)
         ).add_to(m)
     route_coords.append(st.session_state['location_coords']['DEPOT'])
     folium.PolyLine(route_coords, color=color, weight=3, opacity=0.8).add_to(m)
-    # vehicle label
-    folium.map.Marker(route_coords[1], icon=folium.DivIcon(html=f"<div style='font-size:12pt;color:{color};font-weight:bold'>{veh}</div>")).add_to(m)
+    folium.map.Marker(
+        route_coords[1],
+        icon=folium.DivIcon(html=f"<div style='font-size:12pt;color:{color};font-weight:bold'>{veh}</div>")
+    ).add_to(m)
 
 # depot marker
 dlat, dlon = st.session_state['location_coords']['DEPOT']
@@ -463,9 +569,10 @@ folium.Marker([dlat, dlon], popup="DEPOT", tooltip="DEPOT", icon=folium.Icon(col
 
 st_folium(m, width=900, height=600)
 
-# ---------- Download results ----------
+# --------------------------
+# Export results
+# --------------------------
 st.subheader('Export results')
-# prepare CSV of assignments
 rows = []
 for vid, stt in vehicle_state.items():
     for loc, p in stt['assigned_packs']:
@@ -476,4 +583,5 @@ if not assign_df.empty:
     st.download_button('Download assignments CSV', data=csv, file_name='assignments.csv', mime='text/csv')
 
 st.info('Page 6 complete. You can copy this file into your Streamlit multipage app as the page module for the sidebar entry (Page 6).')
+
 
