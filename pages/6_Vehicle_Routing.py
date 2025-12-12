@@ -26,7 +26,7 @@ warnings.filterwarnings('ignore')
 # --------------------------
 
 st.set_page_config(layout='wide')
-st.title("Page 6 — Bin Packing + Vehicle Routing (VRP)")
+st.title("Package Allotment & Vehicle Routing ")
 st.markdown(
     "Upload your vehicle & item files, assign coordinates to locations and depot, "
     "run packing and routing, and visualise the routes."
