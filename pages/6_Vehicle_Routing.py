@@ -7,470 +7,845 @@ Original file is located at
     https://colab.research.google.com/drive/1R9ztH5QuwTYeM4UtdpkCCVRDmYAC0t_M
 """
 
+# app/pages/6_🚚_Bin_Packing_&_Routing.py
+
 import streamlit as st
 import pandas as pd
 import numpy as np
 import folium
-from streamlit_folium import st_folium
 from geopy.geocoders import Nominatim
-import time, math, warnings
+from streamlit_folium import st_folium
+import warnings
+import math
+import time
+import osmnx as ox
+import networkx as nx
 from ortools.constraint_solver import routing_enums_pb2, pywrapcp
+from shapely.geometry import LineString, Point
+import plotly.express as px
+import plotly.graph_objects as go
+from io import BytesIO
 
-warnings.filterwarnings('ignore')
+# Page config
+st.set_page_config(
+    page_title="Bin Packing & Routing",
+    page_icon="🚚",
+    layout="wide"
+)
 
-# --------------------------
-# Streamlit Page 6 — Bin Packing + Vehicle Routing
-# Single-file page you can paste into your GitHub Streamlit app as page 6
-# --------------------------
-
-st.set_page_config(layout='wide')
-st.title("Page 6 — Bin Packing + Vehicle Routing (VRP)")
-st.markdown("Upload your vehicle & item files, assign coordinates to locations and depot, run packing and routing, and visualise the routes.")
-
-# ---------- Helpers ----------
-
-def clean_item_columns(df: pd.DataFrame) -> pd.DataFrame:
-    mapping = {
-        'location id': ['location id', 'Location ID', 'location_id', 'LocationId', 'loc_id'],
-        'id': ['id', 'ID', 'item_id', 'Item ID'],
-        'type': ['type', 'Type', 'item_type'],
-        'length': ['length', 'Length'],
-        'width': ['width', 'Width'],
-        'height': ['height', 'Height'],
-        'weight': ['weight', 'Weight'],
-        'quantity': ['quantity', 'Quantity', 'qty'],
-        'stackable': ['stackable', 'Stackable'],
-        'maxStack': ['maxStack', 'MaxStack', 'max_stack', 'Max Stack']
+# Custom CSS
+st.markdown("""
+<style>
+    .main-header {
+        font-size: 2.5rem;
+        color: #1E3A8A;
+        margin-bottom: 1rem;
     }
-    for correct, variants in mapping.items():
-        for v in variants:
-            if v in df.columns and correct not in df.columns:
-                df = df.rename(columns={v: correct})
-    return df
+    .sub-header {
+        font-size: 1.5rem;
+        color: #3B82F6;
+        margin-top: 1.5rem;
+        margin-bottom: 1rem;
+    }
+    .info-box {
+        background-color: #F0F9FF;
+        border-left: 4px solid #3B82F6;
+        padding: 1rem;
+        margin: 1rem 0;
+        border-radius: 0.25rem;
+    }
+    .success-box {
+        background-color: #D1FAE5;
+        border-left: 4px solid #10B981;
+        padding: 1rem;
+        margin: 1rem 0;
+        border-radius: 0.25rem;
+    }
+    .warning-box {
+        background-color: #FEF3C7;
+        border-left: 4px solid #F59E0B;
+        padding: 1rem;
+        margin: 1rem 0;
+        border-radius: 0.25rem;
+    }
+    .metric-card {
+        background-color: #FFFFFF;
+        border-radius: 0.5rem;
+        padding: 1rem;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        margin-bottom: 1rem;
+    }
+</style>
+""", unsafe_allow_html=True)
 
+# Title
+st.markdown('<h1 class="main-header">🚚 Bin Packing & Vehicle Routing</h1>', unsafe_allow_html=True)
+st.markdown("""
+Optimize vehicle loading and routing for efficient delivery across multiple locations.
+Upload your vehicle and item data to get optimized routes.
+""")
 
-def haversine_distance(lat1, lon1, lat2, lon2):
-    R = 6371000
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlambda = math.radians(lon2 - lon1)
-    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
-    return 2 * R * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+# Initialize session state
+if 'vehicle_df' not in st.session_state:
+    st.session_state.vehicle_df = None
+if 'item_df' not in st.session_state:
+    st.session_state.item_df = None
+if 'location_coords' not in st.session_state:
+    st.session_state.location_coords = {}
+if 'solution_routes' not in st.session_state:
+    st.session_state.solution_routes = None
+if 'packing_complete' not in st.session_state:
+    st.session_state.packing_complete = False
+if 'routing_complete' not in st.session_state:
+    st.session_state.routing_complete = False
 
-
-def ensure_session_state(key, default):
-    if key not in st.session_state:
-        st.session_state[key] = default
-
-
-# ---------- UI: Upload ----------
-col1, col2 = st.columns([1, 1])
-with col1:
-    veh_file = st.file_uploader("Vehicle file (CSV or XLSX)", type=['csv', 'xlsx'], key='veh')
-with col2:
-    item_file = st.file_uploader("Items file (CSV or XLSX)", type=['csv', 'xlsx'], key='itm')
-
-if not (veh_file and item_file):
-    st.info("Upload both vehicle and item files to proceed. Example columns described in the original Colab code are expected.")
-    st.stop()
-
-# ---------- Load Data ----------
-try:
-    if veh_file.name.endswith('.csv'):
-        vehicle_df = pd.read_csv(veh_file)
-    else:
-        vehicle_df = pd.read_excel(veh_file)
-
-    if item_file.name.endswith('.csv'):
-        item_df = pd.read_csv(item_file)
-    else:
-        item_df = pd.read_excel(item_file)
-except Exception as e:
-    st.error(f"Failed to read uploaded files: {e}")
-    st.stop()
-
-# Clean headers
-vehicle_df.columns = vehicle_df.columns.str.strip()
-item_df.columns = item_df.columns.str.strip()
-item_df = clean_item_columns(item_df)
-
-# Ensure required columns exist
-required = ['location id','id','type','length','width','height','weight','quantity','stackable','maxStack']
-missing = [c for c in required if c not in item_df.columns]
-if missing:
-    st.error("Items file is missing required columns: " + ", ".join(missing))
-    st.stop()
-
-# Quick preview
-st.subheader("Preview data")
-st.write("Vehicles (first 50 rows):")
-st.dataframe(vehicle_df.head(50))
-st.write("Items (first 50 rows):")
-st.dataframe(item_df.head(50))
-
-# ---------- Units ----------
-st.subheader("Units & conversion")
-LENGTH_UNIT = st.selectbox("Select length unit used in your items file", options=['mm','cm','m'], index=0)
-UNIT_CONVERSION = {'mm': 1/1000.0, 'cm': 1/100.0, 'm': 1.0}
-conv = UNIT_CONVERSION[LENGTH_UNIT]
-st.info(f"Converting lengths to metres using factor {conv}")
-
-# Cast types
-item_df['stackable'] = item_df['stackable'].astype(str).str.upper().isin(['TRUE','1','YES','Y'])
-item_df['quantity'] = item_df['quantity'].astype(int)
-if 'count' in vehicle_df.columns:
-    vehicle_df['count'] = vehicle_df['count'].astype(int)
-else:
-    # assume 1 of each vehicle row if missing
-    vehicle_df['count'] = 1
-
-# ---------- Location assignment (streamlit form) ----------
-st.subheader("Assign coordinates to each location and DEPOT")
-
-# Prepare location list
-unique_locs = sorted(item_df['location id'].unique().tolist())
-unique_locs_display = unique_locs.copy()
-
-ensure_session_state('location_coords', {})
-ensure_session_state('location_names', {})
-
-geolocator = Nominatim(user_agent="streamlit_vrp_app", timeout=5)
-
-loc_cols = st.columns([2,1,1,1])
-for lid in unique_locs_display:
-    with st.expander(f"Location: {lid}", expanded=False):
-        coords = st.session_state['location_coords'].get(lid, None)
-        name = st.session_state['location_names'].get(lid, '')
-        col_a, col_b = st.columns([3,1])
-        with col_a:
-            query = st.text_input(f"Search address for {lid}", value=name, key=f"search_{lid}")
-        with col_b:
-            if st.button(f"Geocode {lid}", key=f"geocode_{lid}"):
+# Sidebar for file uploads
+with st.sidebar:
+    st.header("📁 Upload Data")
+    
+    # File uploaders
+    vehicle_file = st.file_uploader("Upload Vehicle Data (CSV or Excel)", 
+                                   type=['csv', 'xlsx', 'xls'],
+                                   key='vehicle_uploader')
+    
+    item_file = st.file_uploader("Upload Item Data (CSV or Excel)", 
+                                type=['csv', 'xlsx', 'xls'],
+                                key='item_uploader')
+    
+    # Unit selection
+    st.markdown("---")
+    st.subheader("⚙️ Settings")
+    length_unit = st.selectbox("Length Unit", ["mm", "cm", "m"], index=0)
+    
+    # Process button
+    if st.button("🚀 Process Data", type="primary", use_container_width=True):
+        if vehicle_file and item_file:
+            with st.spinner("Loading and processing data..."):
                 try:
-                    time.sleep(1.1)
-                    res = geolocator.geocode(query, exactly_one=True)
-                    if res:
-                        st.session_state['location_coords'][lid] = (res.latitude, res.longitude)
-                        st.session_state['location_names'][lid] = res.address
-                        st.success(f"Found: {res.address} ({res.latitude:.4f}, {res.longitude:.4f})")
+                    # Load vehicle data
+                    if vehicle_file.name.endswith('.csv'):
+                        vehicle_df = pd.read_csv(vehicle_file)
                     else:
-                        st.warning("No result from geocoder — try a different query")
+                        vehicle_df = pd.read_excel(vehicle_file)
+                    
+                    # Load item data
+                    if item_file.name.endswith('.csv'):
+                        item_df = pd.read_csv(item_file)
+                    else:
+                        item_df = pd.read_excel(item_file)
+                    
+                    # Clean headers
+                    vehicle_df.columns = vehicle_df.columns.str.strip()
+                    item_df.columns = item_df.columns.str.strip()
+                    
+                    # Standardize column names
+                    column_mapping = {
+                        'location id': ['location id', 'Location ID', 'location_id', 'LocationId', 'loc_id'],
+                        'id': ['id', 'ID', 'item_id', 'Item ID'],
+                        'type': ['type', 'Type', 'item_type'],
+                        'length': ['length', 'Length'],
+                        'width': ['width', 'Width'],
+                        'height': ['height', 'Height'],
+                        'weight': ['weight', 'Weight'],
+                        'quantity': ['quantity', 'Quantity', 'qty'],
+                        'stackable': ['stackable', 'Stackable'],
+                        'maxStack': ['maxStack', 'MaxStack', 'max_stack', 'Max Stack']
+                    }
+                    
+                    for correct, variants in column_mapping.items():
+                        for v in variants:
+                            if v in item_df.columns and correct not in item_df.columns:
+                                item_df = item_df.rename(columns={v: correct})
+                    
+                    required = ['location id','id','type','length','width','height','weight','quantity','stackable','maxStack']
+                    missing = [c for c in required if c not in item_df.columns]
+                    
+                    if missing:
+                        st.error(f"Items file is missing columns: {missing}")
+                    else:
+                        # Store in session state
+                        st.session_state.vehicle_df = vehicle_df
+                        st.session_state.item_df = item_df
+                        st.session_state.length_unit = length_unit
+                        st.success("✅ Data loaded successfully!")
+                        
                 except Exception as e:
-                    st.error(f"Geocoding error: {e}")
-        # show current coords if exist
-        if lid in st.session_state['location_coords']:
-            lat, lon = st.session_state['location_coords'][lid]
-            st.write(f"Coordinates — lat: {lat:.6f}, lon: {lon:.6f}")
+                    st.error(f"Error loading files: {str(e)}")
+        else:
+            st.warning("Please upload both vehicle and item files.")
 
-# DEPOT
-with st.expander("DEPOT (required)"):
-    dep_query = st.text_input("Search address for DEPOT", value=st.session_state['location_names'].get('DEPOT',''), key='search_DEPOT')
-    if st.button("Geocode DEPOT", key='geocode_DEPOT'):
-        try:
-            time.sleep(1.1)
-            res = geolocator.geocode(dep_query, exactly_one=True)
-            if res:
-                st.session_state['location_coords']['DEPOT'] = (res.latitude, res.longitude)
-                st.session_state['location_names']['DEPOT'] = res.address
-                st.success(f"Depot: {res.address} ({res.latitude:.4f}, {res.longitude:.4f})")
-            else:
-                st.warning("No result for depot — try a different query")
-        except Exception as e:
-            st.error(f"Geocoding error: {e}")
-    if 'DEPOT' in st.session_state['location_coords']:
-        lat, lon = st.session_state['location_coords']['DEPOT']
-        st.write(f"Depot coords — lat: {lat:.6f}, lon: {lon:.6f}")
+# Main content area
+if st.session_state.vehicle_df is not None and st.session_state.item_df is not None:
+    # Create tabs for different sections
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "📊 Data Overview", 
+        "📍 Location Mapping", 
+        "📦 Bin Packing", 
+        "🗺️ Route Optimization", 
+        "🎯 Results"
+    ])
+    
+    with tab1:
+        st.markdown('<h2 class="sub-header">Data Overview</h2>', unsafe_allow_html=True)
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.subheader("Vehicle Data")
+            st.dataframe(st.session_state.vehicle_df, use_container_width=True)
+            
+            # Vehicle metrics
+            total_vehicles = st.session_state.vehicle_df['count'].sum()
+            st.metric("Total Vehicles", total_vehicles)
+        
+        with col2:
+            st.subheader("Item Data (First 20 rows)")
+            st.dataframe(st.session_state.item_df.head(20), use_container_width=True)
+            
+            # Item metrics
+            total_items = st.session_state.item_df['quantity'].sum()
+            unique_locations = st.session_state.item_df['location id'].nunique()
+            st.metric("Total Items", total_items)
+            st.metric("Unique Locations", unique_locations)
+    
+    with tab2:
+        st.markdown('<h2 class="sub-header">Location Mapping</h2>', unsafe_allow_html=True)
+        
+        st.markdown("""
+        <div class="info-box">
+        ℹ️ Enter addresses for each location ID. The system will automatically geocode them to get coordinates.
+        </div>
+        """, unsafe_allow_html=True)
+        
+        # Get unique locations from item data
+        unique_locations = st.session_state.item_df['location id'].unique().tolist()
+        
+        # Location mapping interface
+        location_data = []
+        
+        for loc in unique_locations:
+            col1, col2, col3 = st.columns([1, 2, 1])
+            with col1:
+                st.text_input("Location ID", value=str(loc), disabled=True, key=f"loc_id_{loc}")
+            with col2:
+                address = st.text_input(f"Address for {loc}", 
+                                       placeholder="Enter full address...",
+                                       key=f"address_{loc}")
+            with col3:
+                if address:
+                    if st.button("📍 Geocode", key=f"geocode_{loc}"):
+                        with st.spinner("Geocoding..."):
+                            try:
+                                geolocator = Nominatim(user_agent="streamlit_vrp")
+                                location = geolocator.geocode(address)
+                                if location:
+                                    st.session_state.location_coords[str(loc)] = (
+                                        location.latitude, 
+                                        location.longitude
+                                    )
+                                    st.success(f"✓ Coordinates: {location.latitude:.4f}, {location.longitude:.4f}")
+                                else:
+                                    st.error("Address not found")
+                            except Exception as e:
+                                st.error(f"Geocoding error: {str(e)}")
+        
+        # Depot location
+        st.markdown("---")
+        st.subheader("🏢 Depot Location")
+        depot_address = st.text_input("Depot Address", placeholder="Enter depot address...")
+        
+        if depot_address and st.button("📍 Set Depot", type="primary"):
+            with st.spinner("Geocoding depot..."):
+                try:
+                    geolocator = Nominatim(user_agent="streamlit_vrp")
+                    location = geolocator.geocode(depot_address)
+                    if location:
+                        st.session_state.location_coords["DEPOT"] = (
+                            location.latitude, 
+                            location.longitude
+                        )
+                        st.success(f"✓ Depot Coordinates: {location.latitude:.4f}, {location.longitude:.4f}")
+                    else:
+                        st.error("Depot address not found")
+                except Exception as e:
+                    st.error(f"Geocoding error: {str(e)}")
+        
+        # Display mapped locations
+        if st.session_state.location_coords:
+            st.markdown("---")
+            st.subheader("📍 Mapped Locations")
+            
+            # Create DataFrame for display
+            location_list = []
+            for loc_id, coords in st.session_state.location_coords.items():
+                location_list.append({
+                    'Location ID': loc_id,
+                    'Latitude': coords[0],
+                    'Longitude': coords[1]
+                })
+            
+            if location_list:
+                locations_df = pd.DataFrame(location_list)
+                st.dataframe(locations_df, use_container_width=True)
+                
+                # Show on map
+                if len(location_list) > 1:
+                    center_lat = sum(loc['Latitude'] for loc in location_list) / len(location_list)
+                    center_lon = sum(loc['Longitude'] for loc in location_list) / len(location_list)
+                    
+                    m = folium.Map(location=[center_lat, center_lon], zoom_start=5)
+                    
+                    # Add markers
+                    for loc in location_list:
+                        is_depot = loc['Location ID'] == "DEPOT"
+                        color = 'red' if is_depot else 'blue'
+                        icon = 'home' if is_depot else 'info-sign'
+                        
+                        folium.Marker(
+                            location=[loc['Latitude'], loc['Longitude']],
+                            popup=f"<b>{loc['Location ID']}</b><br>Lat: {loc['Latitude']:.4f}<br>Lon: {loc['Longitude']:.4f}",
+                            icon=folium.Icon(color=color, icon=icon)
+                        ).add_to(m)
+                    
+                    st_folium(m, width=800, height=500)
+    
+    with tab3:
+        st.markdown('<h2 class="sub-header">Bin Packing Optimization</h2>', unsafe_allow_html=True)
+        
+        if not st.session_state.location_coords or "DEPOT" not in st.session_state.location_coords:
+            st.warning("⚠️ Please map all locations and depot first in the Location Mapping tab.")
+        else:
+            if st.button("📦 Run Bin Packing", type="primary"):
+                with st.spinner("Running bin packing optimization..."):
+                    try:
+                        # Convert length unit
+                        UNIT_CONVERSION = {'mm': 1/1000.0, 'cm': 1/100.0, 'm': 1.0}
+                        conv = UNIT_CONVERSION[st.session_state.length_unit]
+                        
+                        # Expand items into pack units
+                        pack_units = []
+                        for _, row in st.session_state.item_df.iterrows():
+                            loc = row['location id']
+                            item_id = row['id']
+                            L = float(row['length']) * conv
+                            W = float(row['width']) * conv
+                            H = float(row['height']) * conv
+                            weight = float(row['weight'])
+                            qty = int(row['quantity'])
+                            stackable = bool(row['stackable'])
+                            max_stack = int(row['maxStack']) if not pd.isna(row['maxStack']) else 1
+                            
+                            if stackable and max_stack > 1:
+                                fullstacks = qty // max_stack
+                                rem = qty % max_stack
+                                for _ in range(fullstacks):
+                                    pack_units.append({
+                                        'location id': loc,
+                                        'item_id': item_id,
+                                        'length_m': L,
+                                        'width_m': W,
+                                        'height_m': H * max_stack,
+                                        'weight_kg': weight * max_stack,
+                                        'count': max_stack
+                                    })
+                                if rem > 0:
+                                    pack_units.append({
+                                        'location id': loc,
+                                        'item_id': item_id,
+                                        'length_m': L,
+                                        'width_m': W,
+                                        'height_m': H * rem,
+                                        'weight_kg': weight * rem,
+                                        'count': rem
+                                    })
+                            else:
+                                for _ in range(qty):
+                                    pack_units.append({
+                                        'location id': loc,
+                                        'item_id': item_id,
+                                        'length_m': L,
+                                        'width_m': W,
+                                        'height_m': H,
+                                        'weight_kg': weight,
+                                        'count': 1
+                                    })
+                        
+                        # Create vehicle instances
+                        vehicle_instances = []
+                        for _, v in st.session_state.vehicle_df.iterrows():
+                            v_count = int(v['count'])
+                            for i in range(v_count):
+                                inst = {
+                                    'vehicle_type': v.get('vehicle_id', f"veh_{_}"),
+                                    'length_m': float(v['length']) * conv,
+                                    'width_m': float(v['width']) * conv,
+                                    'height_m': float(v['height']) * conv,
+                                    'volume_m3': float(v['length']) * conv * float(v['width']) * conv * float(v['height']) * conv,
+                                    'max_load_kg': float(v['max_load']),
+                                    'id': f"{v.get('vehicle_id', 'V')}_{i+1}"
+                                }
+                                inst['volume_m3'] = inst['length_m'] * inst['width_m'] * inst['height_m']
+                                vehicle_instances.append(inst)
+                        
+                        # Packing algorithm
+                        assignments = {}
+                        vehicle_state = {v['id']: {
+                            'remaining_vol': v['volume_m3'],
+                            'remaining_wt': v['max_load_kg'],
+                            'vehicle': v,
+                            'assigned_packs': []
+                        } for v in vehicle_instances}
+                        
+                        # Group by location
+                        pack_df = pd.DataFrame(pack_units)
+                        grouped = pack_df.groupby('location id')
+                        
+                        for loc, group in grouped:
+                            packs = group.sort_values('volume_m3', ascending=False).to_dict('records')
+                            packs_left = packs.copy()
+                            
+                            # Try to pack entire location into one vehicle
+                            vol_total = sum(p['volume_m3'] for p in packs_left)
+                            wt_total = sum(p['weight_kg'] for p in packs_left)
+                            
+                            single_candidate = None
+                            for vid, st_info in vehicle_state.items():
+                                if (st_info['remaining_vol'] + 1e-9 >= vol_total and 
+                                    st_info['remaining_wt'] + 1e-9 >= wt_total):
+                                    single_candidate = vid
+                                    break
+                            
+                            if single_candidate:
+                                vehicle_state[single_candidate]['assigned_packs'].extend([(loc, p) for p in packs_left])
+                                vehicle_state[single_candidate]['remaining_vol'] -= vol_total
+                                vehicle_state[single_candidate]['remaining_wt'] -= wt_total
+                                assignments.setdefault(single_candidate, []).append(loc)
+                                continue
+                            
+                            # Greedy packing
+                            for p in packs_left:
+                                placed = False
+                                v_order = sorted(vehicle_state.items(), 
+                                                key=lambda kv: kv[1]['remaining_vol'], 
+                                                reverse=True)
+                                for vid, st_info in v_order:
+                                    if (st_info['remaining_vol'] + 1e-9 >= p['volume_m3'] and 
+                                        st_info['remaining_wt'] + 1e-9 >= p['weight_kg']):
+                                        st_info['assigned_packs'].append((loc, p))
+                                        st_info['remaining_vol'] -= p['volume_m3']
+                                        st_info['remaining_wt'] -= p['weight_kg']
+                                        assignments.setdefault(vid, []).append(loc)
+                                        placed = True
+                                        break
+                                if not placed:
+                                    st.warning(f"Could not place pack for location {loc}")
+                        
+                        # Store results
+                        st.session_state.pack_results = {
+                            'pack_units': pack_units,
+                            'vehicle_instances': vehicle_instances,
+                            'vehicle_state': vehicle_state,
+                            'assignments': assignments,
+                            'pack_df': pack_df
+                        }
+                        st.session_state.packing_complete = True
+                        
+                        # Display results
+                        st.markdown('<div class="success-box">✅ Bin packing completed successfully!</div>', unsafe_allow_html=True)
+                        
+                        col1, col2, col3 = st.columns(3)
+                        
+                        with col1:
+                            used_vehicles = len([v for v in vehicle_state.values() if v['assigned_packs']])
+                            st.metric("Vehicles Used", used_vehicles)
+                        
+                        with col2:
+                            total_packs = len(pack_units)
+                            st.metric("Total Pack Units", total_packs)
+                        
+                        with col3:
+                            total_volume = sum(v['vehicle']['volume_m3'] for v in vehicle_instances)
+                            used_volume = total_volume - sum(v['remaining_vol'] for v in vehicle_state.values())
+                            efficiency = (used_volume / total_volume) * 100
+                            st.metric("Volume Efficiency", f"{efficiency:.1f}%")
+                        
+                        # Show vehicle assignments
+                        st.subheader("📋 Vehicle Assignments")
+                        for vid, st_info in vehicle_state.items():
+                            if st_info['assigned_packs']:
+                                assigned_locs = sorted(set([x[0] for x in st_info['assigned_packs']]))
+                                used_vol = st_info['vehicle']['volume_m3'] - st_info['remaining_vol']
+                                used_wt = st_info['vehicle']['max_load_kg'] - st_info['remaining_wt']
+                                
+                                with st.expander(f"Vehicle {vid}"):
+                                    st.write(f"**Locations:** {', '.join(str(loc) for loc in assigned_locs)}")
+                                    st.write(f"**Volume Used:** {used_vol:.3f} m³ / {st_info['vehicle']['volume_m3']:.3f} m³")
+                                    st.write(f"**Weight Used:** {used_wt:.1f} kg / {st_info['vehicle']['max_load_kg']:.1f} kg")
+                                    st.write(f"**Number of Packs:** {len(st_info['assigned_packs'])}")
+                        
+                    except Exception as e:
+                        st.error(f"Error in bin packing: {str(e)}")
+    
+    with tab4:
+        st.markdown('<h2 class="sub-header">Route Optimization</h2>', unsafe_allow_html=True)
+        
+        if not st.session_state.packing_complete:
+            st.warning("⚠️ Please complete bin packing first.")
+        else:
+            if st.button("🗺️ Optimize Routes", type="primary"):
+                with st.spinner("Optimizing vehicle routes..."):
+                    try:
+                        # Calculate distance matrix
+                        def haversine_distance(lat1, lon1, lat2, lon2):
+                            R = 6371000
+                            phi1, phi2 = math.radians(lat1), math.radians(lat2)
+                            dphi = math.radians(lat2 - lat1)
+                            dlambda = math.radians(lon2 - lon1)
+                            a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
+                            return 2 * R * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+                        
+                        depot_coord = st.session_state.location_coords["DEPOT"]
+                        loc_ids = sorted([k for k in st.session_state.location_coords.keys() if k != "DEPOT"])
+                        all_ids = loc_ids + ["DEPOT"]
+                        coords = [st.session_state.location_coords[lid] for lid in all_ids]
+                        
+                        N = len(coords)
+                        dist_mat = np.zeros((N, N), dtype=np.int64)
+                        
+                        for i in range(N):
+                            lat1, lon1 = coords[i]
+                            for j in range(N):
+                                lat2, lon2 = coords[j]
+                                dist = haversine_distance(lat1, lon1, lat2, lon2)
+                                dist_mat[i, j] = int(dist)
+                        
+                        # VRP setup
+                        location_idx_map = {
+                            loc: i for i, loc in enumerate(
+                                sorted(st.session_state.location_coords.keys(), 
+                                      key=lambda x: (str(x) == "DEPOT", x))
+                            )
+                        }
+                        
+                        # Calculate demands
+                        demand_weight = np.zeros(len(location_idx_map), dtype=int)
+                        demand_volume = np.zeros(len(location_idx_map), dtype=int)
+                        
+                        for vid, st_info in st.session_state.pack_results['vehicle_state'].items():
+                            for loc, p in st_info['assigned_packs']:
+                                idx = location_idx_map[loc]
+                                demand_weight[idx] += int(math.ceil(p['weight_kg']))
+                                demand_volume[idx] += int(math.ceil(p['volume_m3'] * 1000))
+                        
+                        # Vehicle capacities
+                        vehicle_ids = []
+                        vehicle_cap_wt = []
+                        vehicle_cap_vol = []
+                        
+                        for vid, st_info in st.session_state.pack_results['vehicle_state'].items():
+                            if st_info['assigned_packs']:
+                                vehicle_ids.append(vid)
+                                vehicle_cap_wt.append(int(math.floor(st_info['vehicle']['max_load_kg'])))
+                                vehicle_cap_vol.append(int(math.floor(st_info['vehicle']['volume_m3'] * 1000)))
+                        
+                        # OR-Tools VRP
+                        loc_ids_sorted = sorted([k for k in st.session_state.location_coords.keys() if k != "DEPOT"])
+                        num_locations = len(loc_ids_sorted)
+                        num_nodes = num_locations + 1
+                        depot_index = num_locations
+                        num_vehicles = len(vehicle_ids)
+                        
+                        manager = pywrapcp.RoutingIndexManager(num_nodes, num_vehicles, depot_index)
+                        routing = pywrapcp.RoutingModel(manager)
+                        
+                        # Distance callback
+                        def distance_callback(i, j):
+                            ni = manager.IndexToNode(i)
+                            nj = manager.IndexToNode(j)
+                            return int(dist_mat[ni][nj])
+                        
+                        transit_callback_index = routing.RegisterTransitCallback(distance_callback)
+                        routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
+                        
+                        # Capacity dimensions
+                        def demand_weight_callback(index):
+                            node = manager.IndexToNode(index)
+                            if node == depot_index:
+                                return 0
+                            return int(demand_weight[node])
+                        
+                        def demand_vol_callback(index):
+                            node = manager.IndexToNode(index)
+                            if node == depot_index:
+                                return 0
+                            return int(demand_volume[node])
+                        
+                        demand_wt_cb = routing.RegisterUnaryTransitCallback(demand_weight_callback)
+                        demand_vol_cb = routing.RegisterUnaryTransitCallback(demand_vol_callback)
+                        
+                        routing.AddDimensionWithVehicleCapacity(
+                            demand_wt_cb, 0, vehicle_cap_wt, True, 'Weight'
+                        )
+                        routing.AddDimensionWithVehicleCapacity(
+                            demand_vol_cb, 0, vehicle_cap_vol, True, 'Volume'
+                        )
+                        
+                        # Solver parameters
+                        search_params = pywrapcp.DefaultRoutingSearchParameters()
+                        search_params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
+                        search_params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
+                        search_params.time_limit.seconds = 30
+                        
+                        # Solve
+                        solution = routing.SolveWithParameters(search_params)
+                        
+                        if solution:
+                            # Extract routes
+                            solution_routes = {}
+                            for veh_id in range(num_vehicles):
+                                index = routing.Start(veh_id)
+                                route = []
+                                while not routing.IsEnd(index):
+                                    node = manager.IndexToNode(index)
+                                    if node != depot_index:
+                                        route.append(loc_ids_sorted[node])
+                                    index = solution.Value(routing.NextVar(index))
+                                if route:  # Only add if route has locations
+                                    solution_routes[vehicle_ids[veh_id]] = route
+                            
+                            st.session_state.solution_routes = solution_routes
+                            st.session_state.routing_complete = True
+                            
+                            st.markdown('<div class="success-box">✅ Route optimization completed successfully!</div>', unsafe_allow_html=True)
+                            
+                            # Display route summary
+                            col1, col2, col3 = st.columns(3)
+                            with col1:
+                                active_vehicles = len(solution_routes)
+                                st.metric("Active Vehicles", active_vehicles)
+                            with col2:
+                                total_stops = sum(len(route) for route in solution_routes.values())
+                                st.metric("Total Stops", total_stops)
+                            with col3:
+                                avg_stops = total_stops / max(1, active_vehicles)
+                                st.metric("Avg Stops/Vehicle", f"{avg_stops:.1f}")
+                            
+                            # Show individual routes
+                            st.subheader("📋 Optimized Routes")
+                            for veh_id, route in solution_routes.items():
+                                with st.expander(f"Vehicle {veh_id} - {len(route)} stops"):
+                                    route_text = " → ".join([str(loc) for loc in route])
+                                    st.write(f"**Route:** DEPOT → {route_text} → DEPOT")
+                                    st.write(f"**Distance:** {solution.ObjectiveValue()/1000:.1f} km (approx)")
+                        
+                        else:
+                            st.error("No feasible route solution found.")
+                            
+                    except Exception as e:
+                        st.error(f"Error in route optimization: {str(e)}")
+    
+    with tab5:
+        st.markdown('<h2 class="sub-header">Final Results & Visualization</h2>', unsafe_allow_html=True)
+        
+        if not st.session_state.routing_complete:
+            st.warning("⚠️ Please complete route optimization first.")
+        else:
+            # Results summary
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Total Vehicles", len(st.session_state.vehicle_df))
+            with col2:
+                st.metric("Used Vehicles", len(st.session_state.solution_routes))
+            with col3:
+                total_stops = sum(len(route) for route in st.session_state.solution_routes.values())
+                st.metric("Total Deliveries", total_stops)
+            with col4:
+                total_items = st.session_state.item_df['quantity'].sum()
+                st.metric("Total Items", total_items)
+            
+            # Interactive map
+            st.subheader("🗺️ Route Visualization")
+            
+            # Calculate center point
+            all_lats = [st.session_state.location_coords["DEPOT"][0]]
+            all_lons = [st.session_state.location_coords["DEPOT"][1]]
+            
+            for route in st.session_state.solution_routes.values():
+                for loc in route:
+                    lat, lon = st.session_state.location_coords[str(loc)]
+                    all_lats.append(lat)
+                    all_lons.append(lon)
+            
+            center_lat = sum(all_lats) / len(all_lats)
+            center_lon = sum(all_lons) / len(all_lons)
+            
+            # Create map
+            m = folium.Map(location=[center_lat, center_lon], zoom_start=5)
+            
+            # Add India boundary
+            india_bbox = [[6.5546079, 68.1113787], [35.6745457, 97.395561]]
+            folium.Rectangle(bounds=india_bbox, color='#cccccc', fill=True, 
+                           fill_opacity=0.1, weight=1).add_to(m)
+            
+            # Colors for different vehicles
+            colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', 
+                     '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22']
+            
+            # Plot routes
+            for i, (veh_id, route) in enumerate(st.session_state.solution_routes.items()):
+                color = colors[i % len(colors)]
+                
+                # Create route coordinates
+                route_coords = [st.session_state.location_coords["DEPOT"]]
+                for loc in route:
+                    route_coords.append(st.session_state.location_coords[str(loc)])
+                route_coords.append(st.session_state.location_coords["DEPOT"])
+                
+                # Add route line
+                folium.PolyLine(
+                    route_coords,
+                    color=color,
+                    weight=3,
+                    opacity=0.7,
+                    tooltip=f"Vehicle {veh_id}"
+                ).add_to(m)
+                
+                # Add markers for stops
+                for loc in route:
+                    lat, lon = st.session_state.location_coords[str(loc)]
+                    folium.CircleMarker(
+                        location=[lat, lon],
+                        radius=6,
+                        color=color,
+                        fill=True,
+                        fill_color=color,
+                        popup=f"<b>Location {loc}</b><br>Vehicle: {veh_id}"
+                    ).add_to(m)
+                
+                # Add vehicle label
+                if route:
+                    first_stop = st.session_state.location_coords[str(route[0])]
+                    folium.Marker(
+                        location=first_stop,
+                        icon=folium.DivIcon(
+                            html=f'<div style="font-size: 12pt; font-weight: bold; color: {color}">V{veh_id}</div>'
+                        )
+                    ).add_to(m)
+            
+            # Add depot marker
+            depot_lat, depot_lon = st.session_state.location_coords["DEPOT"]
+            folium.Marker(
+                location=[depot_lat, depot_lon],
+                popup="<b>DEPOT</b>",
+                icon=folium.Icon(color='black', icon='home', prefix='fa')
+            ).add_to(m)
+            
+            # Display map
+            st_folium(m, width=1000, height=600)
+            
+            # Download results
+            st.subheader("📥 Download Results")
+            
+            # Create summary DataFrame
+            summary_data = []
+            for veh_id, route in st.session_state.solution_routes.items():
+                summary_data.append({
+                    'Vehicle ID': veh_id,
+                    'Number of Stops': len(route),
+                    'Route': ' → '.join([str(loc) for loc in route]),
+                    'Vehicle Type': next((v['vehicle_type'] for v in st.session_state.pack_results['vehicle_instances'] 
+                                        if v['id'] == veh_id), 'Unknown')
+                })
+            
+            summary_df = pd.DataFrame(summary_data)
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                # Export as CSV
+                csv = summary_df.to_csv(index=False)
+                st.download_button(
+                    label="📄 Download Route Summary (CSV)",
+                    data=csv,
+                    file_name="route_summary.csv",
+                    mime="text/csv"
+                )
+            
+            with col2:
+                # Export as Excel
+                output = BytesIO()
+                with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                    summary_df.to_excel(writer, sheet_name='Route Summary', index=False)
+                    st.session_state.vehicle_df.to_excel(writer, sheet_name='Vehicle Data', index=False)
+                    st.session_state.item_df.to_excel(writer, sheet_name='Item Data', index=False)
+                
+                st.download_button(
+                    label="📊 Download Full Report (Excel)",
+                    data=output.getvalue(),
+                    file_name="vrp_full_report.xlsx",
+                    mime="application/vnd.ms-excel"
+                )
+            
+            # Display route details
+            st.subheader("📋 Detailed Route Information")
+            for veh_id, route in st.session_state.solution_routes.items():
+                with st.expander(f"Vehicle {veh_id} Details", expanded=True):
+                    # Get vehicle info
+                    vehicle_info = next((v for v in st.session_state.pack_results['vehicle_instances'] 
+                                       if v['id'] == veh_id), None)
+                    
+                    if vehicle_info:
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            st.metric("Capacity", f"{vehicle_info['max_load_kg']} kg")
+                        with col2:
+                            st.metric("Volume", f"{vehicle_info['volume_m3']:.2f} m³")
+                        with col3:
+                            st.metric("Dimensions", f"{vehicle_info['length_m']:.2f}×{vehicle_info['width_m']:.2f}×{vehicle_info['height_m']:.2f} m")
+                    
+                    # Show route sequence
+                    st.write("**Delivery Sequence:**")
+                    sequence_text = "DEPOT → " + " → ".join([f"📍 {loc}" for loc in route]) + " → DEPOT"
+                    st.info(sequence_text)
+                    
+                    # Show items per location
+                    st.write("**Items per Location:**")
+                    vehicle_state = st.session_state.pack_results['vehicle_state'][veh_id]
+                    location_items = {}
+                    for loc, pack in vehicle_state['assigned_packs']:
+                        if loc not in location_items:
+                            location_items[loc] = []
+                        location_items[loc].append(pack['item_id'])
+                    
+                    for loc, items in location_items.items():
+                        st.write(f"- **{loc}:** {len(items)} items ({', '.join(set(items))})")
 
-# Check if all locations have coords
-missing_coords = [l for l in unique_locs if l not in st.session_state['location_coords']]
-if 'DEPOT' not in st.session_state['location_coords']:
-    st.warning("Please set coordinates for the DEPOT to continue.")
-    st.stop()
-if missing_coords:
-    st.warning(f"Coordinates missing for locations: {missing_coords}. Please assign them to continue.")
-    st.stop()
-
-# Show map with all points
-st.subheader("Locations map")
-all_coords = list(st.session_state['location_coords'].values())
-all_lats = [c[0] for c in all_coords]
-all_lons = [c[1] for c in all_coords]
-center_lat = float(np.mean(all_lats))
-center_lon = float(np.mean(all_lons))
-map_object = folium.Map(location=[center_lat, center_lon], zoom_start=8, tiles='CartoDB positron')
-for lid, (lat, lon) in st.session_state['location_coords'].items():
-    folium.Marker([lat, lon], popup=f"{lid}: {st.session_state['location_names'].get(lid,'')}", tooltip=str(lid)).add_to(map_object)
-st_folium(map_object, width=900, height=500)
-
-# ---------- Build distance matrix (Haversine) ----------
-st.subheader("Build distance matrix & expand items into pack-units")
-# Determine order: all locations except depot, then depot last (this matches OR-Tools indexing used later)
-loc_ids = sorted([k for k in st.session_state['location_coords'].keys() if k != 'DEPOT'])
-all_ids = loc_ids + ['DEPOT']
-coords = [st.session_state['location_coords'][lid] for lid in all_ids]
-N = len(coords)
-
-dist_mat = np.zeros((N,N), dtype=np.int64)
-for i in range(N):
-    lat1, lon1 = coords[i]
-    for j in range(N):
-        lat2, lon2 = coords[j]
-        dist_mat[i,j] = int(haversine_distance(lat1, lon1, lat2, lon2))
-
-st.write(f"Distance matrix built for {N} nodes (meters)")
-
-# ---------- Expand items into pack units ----------
-pack_units = []
-for _, row in item_df.iterrows():
-    loc = row['location id']
-    item_id = row['id']
-    L = float(row['length']) * conv
-    W = float(row['width']) * conv
-    H = float(row['height']) * conv
-    weight = float(row['weight'])
-    qty = int(row['quantity'])
-    stackable = bool(row['stackable'])
-    max_stack = int(row['maxStack']) if not pd.isna(row['maxStack']) else 1
-    if stackable and max_stack > 1:
-        fullstacks = qty // max_stack
-        rem = qty % max_stack
-        for _ in range(fullstacks):
-            pack_units.append({'location id': loc, 'item_id': item_id, 'length_m': L, 'width_m': W, 'height_m': H * max_stack, 'weight_kg': weight * max_stack, 'count': max_stack})
-        if rem > 0:
-            pack_units.append({'location id': loc, 'item_id': item_id, 'length_m': L, 'width_m': W, 'height_m': H * rem, 'weight_kg': weight * rem, 'count': rem})
-    else:
-        for _ in range(qty):
-            pack_units.append({'location id': loc, 'item_id': item_id, 'length_m': L, 'width_m': W, 'height_m': H, 'weight_kg': weight, 'count': 1})
-
-pack_df = pd.DataFrame(pack_units)
-pack_df['volume_m3'] = pack_df['length_m'] * pack_df['width_m'] * pack_df['height_m']
-st.write(f"Created {len(pack_df)} pack-units from the items file")
-st.dataframe(pack_df.head(50))
-
-# ---------- Instantiate vehicles ----------
-st.subheader("Instantiate vehicle instances")
-vehicle_instances = []
-for _, v in vehicle_df.iterrows():
-    v_count = int(v.get('count',1))
-    for i in range(v_count):
-        inst = {
-            'vehicle_type': v.get('vehicle_id', f"veh_{_}"),
-            'length_m': float(v['length']) * conv if 'length' in v else 0.0,
-            'width_m': float(v['width']) * conv if 'width' in v else 0.0,
-            'height_m': float(v['height']) * conv if 'height' in v else 0.0,
-            'max_load_kg': float(v.get('max_load', v.get('max_load_kg', 0.0))),
-            'id': f"{v.get('vehicle_id','veh')}_{i+1}"
-        }
-        inst['volume_m3'] = inst['length_m'] * inst['width_m'] * inst['height_m']
-        vehicle_instances.append(inst)
-
-if not vehicle_instances:
-    st.error('No vehicle instances created. Check vehicle file columns (length,width,height,max_load,count)')
-    st.stop()
-
-st.write(f"Instantiated {len(vehicle_instances)} vehicle instances")
-st.dataframe(pd.DataFrame(vehicle_instances))
-
-# ---------- Pack by location (greedy heuristic) ----------
-st.subheader("Bin packing (assign packs to vehicles)")
-
-# initialize vehicle states
-vehicle_state = {v['id']:{'remaining_vol': v['volume_m3'],'remaining_wt': v['max_load_kg'],'vehicle':v,'assigned_packs':[]} for v in vehicle_instances}
-
-grouped = pack_df.groupby('location id')
-assignments = {}
-for loc, group in grouped:
-    packs = group.sort_values('volume_m3', ascending=False).to_dict('records')
-    packs_left = packs.copy()
-    def packs_total_volume_weight(packs_list):
-        return sum(p['volume_m3'] for p in packs_list), sum(p['weight_kg'] for p in packs_list)
-    vol_total, wt_total = packs_total_volume_weight(packs_left)
-    single_candidate = None
-    for vid, stt in vehicle_state.items():
-        if stt['remaining_vol'] + 1e-9 >= vol_total and stt['remaining_wt'] + 1e-9 >= wt_total:
-            single_candidate = vid
-            break
-    if single_candidate:
-        vehicle_state[single_candidate]['assigned_packs'].extend([(loc, p) for p in packs_left])
-        vehicle_state[single_candidate]['remaining_vol'] -= vol_total
-        vehicle_state[single_candidate]['remaining_wt'] -= wt_total
-        assignments.setdefault(single_candidate, []).append(loc)
-        continue
-    # greedy
-    for p in packs_left:
-        placed = False
-        v_order = sorted(vehicle_state.items(), key=lambda kv: kv[1]['remaining_vol'], reverse=True)
-        for vid, stt in v_order:
-            if stt['remaining_vol'] + 1e-9 >= p['volume_m3'] and stt['remaining_wt'] + 1e-9 >= p['weight_kg']:
-                stt['assigned_packs'].append((loc, p))
-                stt['remaining_vol'] -= p['volume_m3']
-                stt['remaining_wt'] -= p['weight_kg']
-                assignments.setdefault(vid, []).append(loc)
-                placed = True
-                break
-        if not placed:
-            st.warning(f"Could not place pack for location {loc}, item {p['item_id']} (vol {p['volume_m3']:.3f}, wt {p['weight_kg']:.1f}).")
-
-used_vehicles = [v for v in vehicle_state.values() if v['assigned_packs']]
-st.write(f"Vehicles used: {len(used_vehicles)}")
-for vid, stt in vehicle_state.items():
-    if stt['assigned_packs']:
-        assigned_locs = sorted(set([x[0] for x in stt['assigned_packs']]))
-        used_vol = stt['vehicle']['volume_m3'] - stt['remaining_vol']
-        used_wt = stt['vehicle']['max_load_kg'] - stt['remaining_wt']
-        st.write(f"Vehicle {vid}: visits {assigned_locs}, used_vol={used_vol:.3f}m3, used_wt={used_wt:.1f}kg")
-
-# ---------- Build demands for OR-Tools ----------
-st.subheader("Create VRP model and solve (OR-Tools)")
-
-# Build mapping of location -> index consistent with distance matrix
-location_idx_map = {loc: i for i, loc in enumerate(all_ids)}
-num_nodes = len(all_ids)
-num_locations = num_nodes - 1  # excluding depot
-
-demand_weight = np.zeros(num_nodes, dtype=int)
-demand_volume = np.zeros(num_nodes, dtype=int)
-
-for vid, stt in vehicle_state.items():
-    for loc, p in stt['assigned_packs']:
-        idx = location_idx_map[loc]
-        demand_weight[idx] += int(math.ceil(p['weight_kg']))
-        demand_volume[idx] += int(math.ceil(p['volume_m3'] * 1000))
-
-# Vehicle capacity arrays
-vehicle_ids = []
-vehicle_cap_wt = []
-vehicle_cap_vol = []
-for vid, stt in vehicle_state.items():
-    vehicle_ids.append(vid)
-    vehicle_cap_wt.append(int(math.floor(stt['vehicle']['max_load_kg'])))
-    vehicle_cap_vol.append(int(math.floor(stt['vehicle']['volume_m3'] * 1000)))
-
-if len(vehicle_ids) == 0:
-    st.error('No vehicles available for routing. Aborting')
-    st.stop()
-
-# OR-Tools setup
-manager = pywrapcp.RoutingIndexManager(num_nodes, len(vehicle_ids), location_idx_map['DEPOT'])
-routing = pywrapcp.RoutingModel(manager)
-
-# cost matrix (distance)
-cost_matrix = dist_mat.tolist()
-
-def distance_callback(i, j):
-    ni = manager.IndexToNode(i)
-    nj = manager.IndexToNode(j)
-    return int(cost_matrix[ni][nj])
-
-transit_callback_index = routing.RegisterTransitCallback(distance_callback)
-routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
-
-# Weight dimension
-def demand_weight_callback(index):
-    node = manager.IndexToNode(index)
-    return 0 if node == location_idx_map['DEPOT'] else int(demand_weight[node])
-
-demand_wt_cb = routing.RegisterUnaryTransitCallback(demand_weight_callback)
-routing.AddDimensionWithVehicleCapacity(demand_wt_cb, 0, vehicle_cap_wt, True, 'Weight')
-
-# Volume dimension
-def demand_vol_callback(index):
-    node = manager.IndexToNode(index)
-    return 0 if node == location_idx_map['DEPOT'] else int(demand_volume[node])
-
-demand_vol_cb = routing.RegisterUnaryTransitCallback(demand_vol_callback)
-routing.AddDimensionWithVehicleCapacity(demand_vol_cb, 0, vehicle_cap_vol, True, 'Volume')
-
-# Solver params
-search_params = pywrapcp.DefaultRoutingSearchParameters()
-search_params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
-search_params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
-search_params.time_limit.seconds = 30
-
-with st.spinner('Solving VRP...'):
-    solution = routing.SolveWithParameters(search_params)
-
-if not solution:
-    st.error('No VRP solution found')
-    st.stop()
-
-# Extract routes
-solution_routes = {}
-for v_idx, vid in enumerate(vehicle_ids):
-    index = routing.Start(v_idx)
-    route = []
-    while not routing.IsEnd(index):
-        node = manager.IndexToNode(index)
-        if node != location_idx_map['DEPOT']:
-            # map node -> location id
-            loc_id = all_ids[node]
-            route.append(loc_id)
-        index = solution.Value(routing.NextVar(index))
-    solution_routes[vid] = route
-
-st.success('Routing solved')
-for v, r in solution_routes.items():
-    if r:
-        st.write(f"{v} -> {r}")
-
-# ---------- Visualization (folium) ----------
-st.subheader("Route visualization")
-# center
-all_lats = [st.session_state['location_coords']['DEPOT'][0]]
-all_lons = [st.session_state['location_coords']['DEPOT'][1]]
-for route_locs in solution_routes.values():
-    for loc in route_locs:
-        lat, lon = st.session_state['location_coords'][loc]
-        all_lats.append(lat)
-        all_lons.append(lon)
-center_lat = float(np.mean(all_lats))
-center_lon = float(np.mean(all_lons))
-
-m = folium.Map(location=[center_lat, center_lon], zoom_start=7, tiles='CartoDB positron')
-# add India bbox lightly for context if needed (kept optional)
-# folium.Rectangle(bounds=[[6.55,68.11],[35.67,97.39]], color='#cccccc', fill=True, fill_opacity=0.02).add_to(m)
-
-colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22']
-for i, (veh, route_locs) in enumerate(solution_routes.items()):
-    if not route_locs:
-        continue
-    color = colors[i % len(colors)]
-    route_coords = [st.session_state['location_coords']['DEPOT']]
-    for loc in route_locs:
-        lat, lon = st.session_state['location_coords'][loc]
-        route_coords.append((lat, lon))
-        folium.CircleMarker(
-            location=[lat, lon], 
-            radius=6,
-            color=color, 
-            fill=True, 
-            fill_color=color, 
-            fill_opacity=0.9, 
-            popup=f"{loc} ({lat:.4f},{lon:.4f})
-        Vehicle: {veh}",
-            tooltip=str(loc)
-        ).add_to(m)
-    route_coords.append(st.session_state['location_coords']['DEPOT'])
-    folium.PolyLine(route_coords, color=color, weight=3, opacity=0.8).add_to(m)
-    # vehicle label
-    folium.map.Marker(route_coords[1], icon=folium.DivIcon(html=f"<div style='font-size:12pt;color:{color};font-weight:bold'>{veh}</div>")).add_to(m)
-
-# depot marker
-dlat, dlon = st.session_state['location_coords']['DEPOT']
-folium.Marker([dlat, dlon], popup="DEPOT", tooltip="DEPOT", icon=folium.Icon(color='black', icon='home')).add_to(m)
-
-st_folium(m, width=900, height=600)
-
-# ---------- Download results ----------
-st.subheader('Export results')
-# prepare CSV of assignments
-rows = []
-for vid, stt in vehicle_state.items():
-    for loc, p in stt['assigned_packs']:
-        rows.append({'vehicle_id': vid, 'location': loc, 'item_id': p['item_id'], 'count': p['count'], 'weight_kg': p['weight_kg'], 'volume_m3': p['volume_m3']})
-assign_df = pd.DataFrame(rows)
-if not assign_df.empty:
-    csv = assign_df.to_csv(index=False).encode('utf-8')
-    st.download_button('Download assignments CSV', data=csv, file_name='assignments.csv', mime='text/csv')
-
-st.info('Page 6 complete. You can copy this file into your Streamlit multipage app as the page module for the sidebar entry (Page 6).')
+else:
+    # Welcome screen when no data is loaded
+    st.markdown("""
+    <div class="info-box">
+    <h3>Welcome to Bin Packing & Vehicle Routing!</h3>
+    <p>This tool helps you optimize vehicle loading and routing for efficient deliveries.</p>
+    
+    <h4>How to use:</h4>
+    <ol>
+        <li><strong>Upload Vehicle Data</strong>: CSV/Excel file with vehicle dimensions and capacities</li>
+        <li><strong>Upload Item Data</strong>: CSV/Excel file with items to be delivered</li>
+        <li><strong>Map Locations</strong>: Enter addresses for delivery locations</li>
+        <li><strong>Run Bin Packing</strong>: Optimize how items are loaded into vehicles</li>
+        <li><strong>Optimize Routes</strong>: Get the most efficient delivery routes</li>
+        <li><strong>View Results</strong>: See the optimized routes on a map and download reports</li>
+    </ol>
+    
+    <h4>Required file formats:</h4>
+    <p><strong>Vehicle File Columns:</strong> vehicle_id, length, width, height, max_load, count</p>
+    <p><strong>Item File Columns:</strong> location id, id, type, length, width, height, weight, quantity, stackable, maxStack</p>
+    
+    <p>Start by uploading your data files in the sidebar! →</p>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # Sample data templates
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.download_button
