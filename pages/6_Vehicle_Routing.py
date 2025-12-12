@@ -439,8 +439,17 @@ for i, (veh, route_locs) in enumerate(solution_routes.items()):
     for loc in route_locs:
         lat, lon = st.session_state['location_coords'][loc]
         route_coords.append((lat, lon))
-        folium.CircleMarker(location=[lat, lon], radius=6, color=color, fill=True, fill_color=color, fill_opacity=0.9, popup=f"{loc} ({lat:.4f},{lon:.4f})
-Vehicle: {veh}", tooltip=str(loc)).add_to(m)
+        folium.CircleMarker(
+            location=[lat, lon], 
+            radius=6,
+            color=color, 
+            fill=True, 
+            fill_color=color, 
+            fill_opacity=0.9, 
+            popup=f"{loc} ({lat:.4f},{lon:.4f})
+        Vehicle: {veh}",
+            tooltip=str(loc)
+        ).add_to(m)
     route_coords.append(st.session_state['location_coords']['DEPOT'])
     folium.PolyLine(route_coords, color=color, weight=3, opacity=0.8).add_to(m)
     # vehicle label
