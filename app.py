@@ -67,4 +67,4 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # Image
-st.image("https://images.unsplash.com/photo-1581090700227-1e8a5c160c4f", use_container_width=True)
+#st.image("https://images.unsplash.com/photo-1581090700227-1e8a5c160c4f", use_container_width=True)
